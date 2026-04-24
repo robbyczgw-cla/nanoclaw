@@ -76,11 +76,31 @@ function summarizeBash(raw: string): string {
   const bin = path.basename(words[0] ?? '');
   const sub = words[1] ?? '';
 
-  if (bin === 'ssh' && words.length >= 3) {
-    const host = words[1];
-    const afterHost = stripped.slice(stripped.indexOf(host) + host.length).trim();
-    const remoteCmd = afterHost.replace(/^["']|["']$/g, '').trim();
-    return truncate(`ssh ${host}: ${remoteCmd}`);
+  if (bin === 'ssh') {
+    // Skip leading flags so we don't mistake `-i` / `-o` / etc. for the host.
+    // Flags that take an argument consume the next word too.
+    const sshFlagsWithArg = new Set(['-i', '-o', '-p', '-J', '-F', '-L', '-R', '-D', '-l', '-c', '-m', '-b', '-B', '-e', '-I', '-Q', '-S', '-W', '-w']);
+    const sshArgs = words.slice(1);
+    let idx = 0;
+    while (idx < sshArgs.length) {
+      const a = sshArgs[idx];
+      if (sshFlagsWithArg.has(a)) {
+        idx += 2;
+        continue;
+      }
+      if (a.startsWith('-')) {
+        idx += 1;
+        continue;
+      }
+      break;
+    }
+    const host = sshArgs[idx];
+    if (host) {
+      const afterHost = sshArgs.slice(idx + 1).join(' ');
+      const remoteCmd = afterHost.replace(/^["']|["']$/g, '').trim();
+      return truncate(remoteCmd ? `ssh ${host}: ${remoteCmd}` : `ssh ${host}`);
+    }
+    return truncate(first);
   }
   if (BASH_WITH_SUBCOMMAND.has(bin) && sub && !sub.startsWith('-')) {
     return truncate(`${bin} ${sub}`);
