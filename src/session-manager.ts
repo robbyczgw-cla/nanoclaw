@@ -133,6 +133,19 @@ export function initSessionFolder(agentGroupId: string, sessionId: string): void
 
   ensureSchema(inboundDbPath(agentGroupId, sessionId), 'inbound');
   ensureSchema(outboundDbPath(agentGroupId, sessionId), 'outbound');
+
+  // When host runs as root (uid 0), the container's node user (uid 1000)
+  // cannot write to freshly-created files. Fix ownership on the session
+  // tree so inbound/outbound DB writes + outbox + heartbeat work.
+  const uid = process.getuid?.();
+  if (uid === 0) {
+    try {
+      const { execSync } = require('child_process') as typeof import('child_process');
+      execSync(`chown -R 1000:1000 ${JSON.stringify(dir)}`, { stdio: 'ignore' });
+    } catch {
+      // best-effort
+    }
+  }
 }
 
 /**
@@ -233,6 +246,31 @@ export function writeSessionMessage(
  * If message content has attachments with base64 `data`, save them to
  * the session's inbox directory and replace with `localPath`.
  */
+const MIME_TO_EXT: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/heic': 'heic',
+  'audio/ogg': 'ogg',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'audio/mp4': 'm4a',
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov',
+  'application/pdf': 'pdf',
+  'text/plain': 'txt',
+  'application/json': 'json',
+  'application/zip': 'zip',
+};
+
+function extForMime(mime: string | undefined): string {
+  if (!mime) return '';
+  const clean = mime.split(';')[0].trim().toLowerCase();
+  return MIME_TO_EXT[clean] ?? '';
+}
+
 function extractAttachmentFiles(
   agentGroupId: string,
   sessionId: string,
@@ -254,7 +292,11 @@ function extractAttachmentFiles(
     if (typeof att.data === 'string') {
       const inboxDir = path.join(sessionDir(agentGroupId, sessionId), 'inbox', messageId);
       fs.mkdirSync(inboxDir, { recursive: true });
-      const filename = (att.name as string) || `attachment-${Date.now()}`;
+      let filename = att.name as string | undefined;
+      if (!filename) {
+        const ext = extForMime(att.mimeType as string | undefined);
+        filename = ext ? `attachment-${Date.now()}.${ext}` : `attachment-${Date.now()}`;
+      }
       const filePath = path.join(inboxDir, filename);
       fs.writeFileSync(filePath, Buffer.from(att.data as string, 'base64'));
       att.localPath = `inbox/${messageId}/${filename}`;
