@@ -225,10 +225,11 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 // ── Provider ──
 
 /**
- * Claude Code auto-compacts context at this window (tokens). Kept here so
- * the generic bootstrap doesn't need to know about Claude-specific env vars.
+ * Claude Code auto-compacts context at this window (tokens). Tuned for the
+ * 1M-context Opus 4.7 variant — plenty of headroom before compaction.
+ * Operator override: set CLAUDE_CODE_AUTO_COMPACT_WINDOW in the host env.
  */
-const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
+const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '900000';
 
 /**
  * Stale-session detection. Matches Claude Code's error text when a
@@ -276,7 +277,7 @@ export class ClaudeProvider implements AgentProvider {
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: TOOL_ALLOWLIST,
         disallowedTools: SDK_DISALLOWED_TOOLS,
-        model: process.env.ANTHROPIC_MODEL || 'claude-opus-4-7',
+        model: process.env.ANTHROPIC_MODEL || 'claude-opus-4-7[1m]',
         env: this.env,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
