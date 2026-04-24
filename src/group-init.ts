@@ -88,5 +88,19 @@ export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: s
       id: group.id,
       steps: initialized,
     });
+
+    // When host runs as root, the container's node user (uid 1000) can't
+    // write to freshly-created dirs. Fix ownership on the writable mounts.
+    const uid = process.getuid?.();
+    if (uid === 0) {
+      try {
+        const { execSync } = require('child_process') as typeof import('child_process');
+        execSync(`chown -R 1000:1000 ${JSON.stringify(groupDir)} ${JSON.stringify(claudeDir)}`, {
+          stdio: 'ignore',
+        });
+      } catch {
+        // best-effort
+      }
+    }
   }
 }

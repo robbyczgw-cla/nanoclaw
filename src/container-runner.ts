@@ -483,7 +483,11 @@ async function buildContainerArgs(
       const accessToken = creds?.claudeAiOauth?.accessToken;
       if (typeof accessToken === 'string' && accessToken.length > 0) {
         for (let i = args.length - 2; i >= 0; i--) {
-          if (args[i] === '-e' && typeof args[i + 1] === 'string' && args[i + 1] === 'CLAUDE_CODE_OAUTH_TOKEN=placeholder') {
+          if (
+            args[i] === '-e' &&
+            typeof args[i + 1] === 'string' &&
+            args[i + 1] === 'CLAUDE_CODE_OAUTH_TOKEN=placeholder'
+          ) {
             args[i + 1] = `CLAUDE_CODE_OAUTH_TOKEN=${accessToken}`;
           }
         }
