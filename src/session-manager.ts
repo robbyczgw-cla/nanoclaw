@@ -265,6 +265,19 @@ const MIME_TO_EXT: Record<string, string> = {
   'application/zip': 'zip',
 };
 
+// Fallback when mimeType is missing — Telegram photos and stickers arrive
+// without an explicit MIME on the attachment object. The `type` field
+// (from the channel bridge) is reliable enough to derive a canonical ext.
+const TYPE_TO_EXT: Record<string, string> = {
+  image: 'jpg',
+  photo: 'jpg',
+  sticker: 'webp',
+  voice: 'ogg',
+  audio: 'mp3',
+  video: 'mp4',
+  animation: 'mp4',
+};
+
 function extForMime(mime: string | undefined): string {
   if (!mime) return '';
   const clean = mime.split(';')[0].trim().toLowerCase();
@@ -294,7 +307,10 @@ function extractAttachmentFiles(
       fs.mkdirSync(inboxDir, { recursive: true });
       let filename = att.name as string | undefined;
       if (!filename) {
-        const ext = extForMime(att.mimeType as string | undefined);
+        let ext = extForMime(att.mimeType as string | undefined);
+        if (!ext && typeof att.type === 'string') {
+          ext = TYPE_TO_EXT[att.type.toLowerCase()] ?? '';
+        }
         filename = ext ? `attachment-${Date.now()}.${ext}` : `attachment-${Date.now()}`;
       }
       const filePath = path.join(inboxDir, filename);
