@@ -212,7 +212,12 @@ const toolStartTimes: Record<string, number> = {};
  * still gets recorded even if visibility errors).
  */
 export const preToolUseVisibility: HookCallback = async (input, toolUseId) => {
-  const i = input as { tool_name?: string; tool_input?: unknown; tool_use_id?: string };
+  const i = input as { tool_name?: string; tool_input?: unknown; tool_use_id?: string; transcript_path?: string };
+  // Skip subagent (Task/Agent) tool calls — user wants only the top-level
+  // agent's activity in chat. Subagent transcripts live under `/subagents/`.
+  if (typeof i.transcript_path === 'string' && i.transcript_path.includes('/subagents/')) {
+    return { continue: true };
+  }
   const toolName = i.tool_name ?? '';
 
   if (SKIP_TOOLS.has(toolName)) return { continue: true };
@@ -240,7 +245,10 @@ export const preToolUseVisibility: HookCallback = async (input, toolUseId) => {
  * out — the pre-hook message is enough signal.
  */
 export const postToolUseVisibility: HookCallback = async (input, toolUseId) => {
-  const i = input as { tool_name?: string; tool_use_id?: string };
+  const i = input as { tool_name?: string; tool_use_id?: string; transcript_path?: string };
+  if (typeof i.transcript_path === 'string' && i.transcript_path.includes('/subagents/')) {
+    return { continue: true };
+  }
   const toolName = i.tool_name ?? '';
 
   if (SKIP_TOOLS.has(toolName)) return { continue: true };
