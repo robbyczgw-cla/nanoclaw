@@ -260,31 +260,53 @@ async function processQuery(
   // Stream liveness is decided host-side via the heartbeat file + processing
   // claim age (see src/host-sweep.ts); if something is truly stuck, the host
   // will kill the container and messages get reset to pending.
+  let pollInFlight = false;
   const pollHandle = setInterval(() => {
-    if (done) return;
+    if (done || pollInFlight) return;
+    pollInFlight = true;
 
-    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
-    // Thread routing is the router's concern — if a message landed in this
-    // session, the agent should see it. Per-thread sessions already isolate
-    // threads into separate containers; shared sessions intentionally merge
-    // everything. Filtering on thread_id here caused deadlocks when the
-    // initial batch and follow-ups had mismatched thread_ids (e.g. a
-    // host-generated welcome trigger with null thread vs a Discord DM reply).
-    const newMessages = getPendingMessages().filter((m) => {
-      if (m.kind === 'system') return false;
-      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
-      return true;
-    });
-    if (newMessages.length > 0) {
-      const newIds = newMessages.map((m) => m.id);
-      markProcessing(newIds);
+    void (async () => {
+      try {
+        // Skip system messages (MCP tool responses) and /clear (needs fresh query).
+        // Thread routing is the router's concern — if a message landed in this
+        // session, the agent should see it. Per-thread sessions already isolate
+        // threads into separate containers; shared sessions intentionally merge
+        // everything. Filtering on thread_id here caused deadlocks when the
+        // initial batch and follow-ups had mismatched thread_ids (e.g. a
+        // host-generated welcome trigger with null thread vs a Discord DM reply).
+        const newMessages = getPendingMessages().filter((m) => {
+          if (m.kind === 'system') return false;
+          if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
+          return true;
+        });
+        if (newMessages.length === 0) return;
 
-      const prompt = formatMessages(newMessages);
-      log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
-      query.push(prompt);
+        const newIds = newMessages.map((m) => m.id);
+        markProcessing(newIds);
 
-      markCompleted(newIds);
-    }
+        // Run pre-task scripts on any task rows so follow-ups honor the same
+        // wakeAgent=false gate as the initial batch. Without this, a task
+        // that arrives during an active query (e.g. a */10 monitoring cron)
+        // would bypass its script and always inject — defeating the gate.
+        const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
+        const preTask = await applyPreTaskScripts(newMessages);
+
+        if (preTask.skipped.length > 0) {
+          markCompleted(preTask.skipped);
+          log(`Dropped ${preTask.skipped.length} follow-up task(s) (wakeAgent=false or script error)`);
+        }
+
+        if (preTask.keep.length === 0) return;
+
+        const keptIds = preTask.keep.map((m) => m.id);
+        const prompt = formatMessages(preTask.keep);
+        log(`Pushing ${preTask.keep.length} follow-up message(s) into active query`);
+        query.push(prompt);
+        markCompleted(keptIds);
+      } finally {
+        pollInFlight = false;
+      }
+    })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
   try {
