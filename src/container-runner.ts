@@ -298,6 +298,23 @@ function buildMounts(
   // skill symlinks)
   mounts.push({ hostPath: claudeDir, containerPath: '/home/node/.claude', readonly: false });
 
+  // Claude Code 2.1.x stores OAuth/config in /home/node/.claude.json (root
+  // dotfile, NOT inside .claude/). Without this mount the auth state is
+  // container-ephemeral and /login must be re-run after every spawn.
+  // Lives next to the .claude-shared dir for this agent group.
+  const claudeJsonPath = path.join(path.dirname(claudeDir), '.claude.json');
+  if (!fs.existsSync(claudeJsonPath)) {
+    fs.writeFileSync(claudeJsonPath, '{}', { mode: 0o600 });
+    try {
+      if (process.getuid?.() === 0) {
+        execSync(`chown 1000:1000 ${JSON.stringify(claudeJsonPath)}`, { stdio: 'ignore' });
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+  mounts.push({ hostPath: claudeJsonPath, containerPath: '/home/node/.claude.json', readonly: false });
+
   // Shared agent-runner source — read-only, same code for all groups.
   const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
   mounts.push({ hostPath: agentRunnerSrc, containerPath: '/app/src', readonly: true });
@@ -448,6 +465,32 @@ async function buildContainerArgs(
     }
   } catch (err) {
     log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
+  }
+
+  // Claude Max OAuth: OneCLI injects CLAUDE_CODE_OAUTH_TOKEN=placeholder,
+  // which Claude Code CLI validates locally and rejects before the proxy
+  // can substitute anything — result is "Not logged in" on every turn.
+  // See https://github.com/qwibitai/nanoclaw/issues/1608 and #1944.
+  //
+  // Fix: replace the placeholder with the real `sk-ant-oat01-...` access
+  // token from `~/.claude/.credentials.json`. Claude Code sends it as
+  // x-api-key (NOT as Bearer), and Anthropic accepts the OAuth token as
+  // an API key — the same flow v1 relies on via OneCLI proxy substitution.
+  const hostCredentialsPath = path.join(process.env.HOME ?? '/root', '.claude', '.credentials.json');
+  if (fs.existsSync(hostCredentialsPath)) {
+    try {
+      const creds = JSON.parse(fs.readFileSync(hostCredentialsPath, 'utf-8'));
+      const accessToken = creds?.claudeAiOauth?.accessToken;
+      if (typeof accessToken === 'string' && accessToken.length > 0) {
+        for (let i = args.length - 2; i >= 0; i--) {
+          if (args[i] === '-e' && typeof args[i + 1] === 'string' && args[i + 1] === 'CLAUDE_CODE_OAUTH_TOKEN=placeholder') {
+            args[i + 1] = `CLAUDE_CODE_OAUTH_TOKEN=${accessToken}`;
+          }
+        }
+      }
+    } catch (err) {
+      log.warn('Could not read host credentials.json for OAuth token injection', { err });
+    }
   }
 
   // Host gateway
