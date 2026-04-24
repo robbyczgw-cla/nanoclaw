@@ -276,6 +276,7 @@ export class ClaudeProvider implements AgentProvider {
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: TOOL_ALLOWLIST,
         disallowedTools: SDK_DISALLOWED_TOOLS,
+        model: process.env.ANTHROPIC_MODEL || 'claude-opus-4-7',
         env: this.env,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
