@@ -31,8 +31,9 @@ const LONG_CALL_THRESHOLD_MS = 3000;
 const TOOL_EMOJI: Record<string, string> = {
   Bash: '🖥️',
   Read: '📖',
-  Write: '✏️',
+  Write: '✍️',
   Edit: '✏️',
+  MultiEdit: '✏️',
   WebFetch: '🌐',
   WebSearch: '🌐',
   Agent: '🤖',
@@ -45,6 +46,7 @@ const TOOL_LABEL: Record<string, string> = {
   Read: 'read',
   Write: 'write',
   Edit: 'edit',
+  MultiEdit: 'edit',
   WebFetch: 'fetch',
   WebSearch: 'search',
   Agent: 'agent',
@@ -52,7 +54,7 @@ const TOOL_LABEL: Record<string, string> = {
   TodoWrite: 'todo',
 };
 
-const BATCH_TOOLS = new Set(['Read', 'Write', 'Edit', 'WebFetch']);
+const BATCH_TOOLS = new Set(['Read', 'Write', 'Edit', 'MultiEdit', 'WebFetch']);
 
 const BASH_WITH_SUBCOMMAND = new Set([
   'git', 'npm', 'pnpm', 'bun', 'apt', 'apt-get', 'pip', 'pip3',
@@ -65,6 +67,102 @@ function log(msg: string): void {
 
 function truncate(s: string): string {
   return s.length > MAX_INPUT_PREVIEW ? s.slice(0, MAX_INPUT_PREVIEW) + '…' : s;
+}
+
+/** Extract domain from URL — keeps preview compact ("github.com" not full URL). */
+function domainOf(url: string): string {
+  return url.replace(/^https?:\/\//, '').split('/')[0];
+}
+
+/** Shorten long file paths from the start with an ellipsis prefix. */
+function shortPath(p: string, maxLen = 35): string {
+  if (p.length <= maxLen) return p;
+  return '…' + p.slice(-(maxLen - 1));
+}
+
+/** Format a tool message with verb-aligned label for easier scanning. */
+function formatToolLine(emoji: string, label: string, desc: string, count = 0): string {
+  const countStr = count > 1 ? ` ×${count}` : '';
+  // Pad label so descriptions align vertically across tool calls.
+  const paddedLabel = label.padEnd(8);
+  return desc ? `${emoji} ${paddedLabel}${countStr} ${desc}`.trimEnd()
+              : `${emoji} ${paddedLabel.trimEnd()}${countStr}`;
+}
+
+/**
+ * Try to extract a string output from a tool_response of unknown shape.
+ * Returns null if nothing string-y is found.
+ */
+function extractResponseText(toolResponse: unknown): string | null {
+  if (toolResponse == null) return null;
+  if (typeof toolResponse === 'string') return toolResponse;
+  if (typeof toolResponse === 'object') {
+    const r = toolResponse as Record<string, unknown>;
+    if (typeof r.output === 'string') return r.output;
+    if (typeof r.text === 'string') return r.text;
+    if (typeof r.content === 'string') return r.content;
+    if (typeof r.stdout === 'string') return r.stdout;
+  }
+  return null;
+}
+
+/**
+ * Compact post-completion result hint — line counts, response sizes, exit codes.
+ * Returns null when there's nothing interesting to add (avoids chat spam).
+ */
+function resultShape(toolName: string, toolResponse: unknown): string | null {
+  const text = extractResponseText(toolResponse);
+  if (toolName === 'Read' && text) {
+    const lines = text.split('\n').length;
+    return `${lines} lines`;
+  }
+  if (toolName === 'Bash' && text) {
+    const nonEmpty = text.split('\n').filter((l) => l.trim()).length;
+    if (nonEmpty >= 5) return `${nonEmpty} lines`;
+    return null;
+  }
+  if (toolName === 'WebFetch' && text) {
+    const kb = Math.round(text.length / 1024);
+    if (kb >= 1) return `${kb}KB`;
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Heuristic failure detection from a normal PostToolUse response. Some tools
+ * report errors via the response payload rather than throwing — this catches
+ * those so we still emit the ❌ marker.
+ */
+function detectFailureFromResponse(_toolName: string, toolResponse: unknown): string | null {
+  if (toolResponse == null) return null;
+  if (typeof toolResponse === 'object') {
+    const r = toolResponse as Record<string, unknown>;
+    if (r.is_error === true || r.success === false) {
+      const explicit = typeof r.error === 'string' ? r.error
+        : typeof r.message === 'string' ? r.message
+        : 'failed';
+      return explicit.replace(/\s+/g, ' ').trim().slice(0, 80);
+    }
+    if (typeof r.error === 'string' && r.error.trim()) {
+      return r.error.replace(/\s+/g, ' ').trim().slice(0, 80);
+    }
+  }
+  const text = extractResponseText(toolResponse);
+  if (!text) return null;
+  // Pattern-based fallback. Conservative — only flag clear failures.
+  const patterns: RegExp[] = [
+    /^(Error|ERROR): (.+)$/m,
+    /(permission denied)/i,
+    /(no such file or directory)/i,
+    /(command not found)/i,
+    /(Traceback \(most recent call last\))/,
+  ];
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m) return m[0].replace(/\s+/g, ' ').trim().slice(0, 80);
+  }
+  return null;
 }
 
 /** Extract the meaningful part of a bash command for the preview. */
@@ -117,7 +215,7 @@ function describeToolInput(toolName: string, toolInput: unknown): string {
     return summarizeBash(input.command);
   }
   if ((toolName === 'Read' || toolName === 'Write' || toolName === 'Edit') && typeof input.file_path === 'string') {
-    return input.file_path;
+    return shortPath(input.file_path);
   }
   if (toolName === 'Glob' && typeof input.pattern === 'string') {
     return input.pattern;
@@ -126,13 +224,17 @@ function describeToolInput(toolName: string, toolInput: unknown): string {
     return input.pattern;
   }
   if (toolName === 'WebFetch' && typeof input.url === 'string') {
-    return truncate(input.url);
+    return domainOf(input.url);
   }
   if (toolName === 'WebSearch' && typeof input.query === 'string') {
-    return truncate(input.query);
+    return `"${truncate(input.query)}"`;
   }
   if (toolName === 'Task' && typeof input.description === 'string') {
     return truncate(input.description);
+  }
+  if (toolName === 'TodoWrite' && Array.isArray(input.todos)) {
+    const n = input.todos.length;
+    return `${n} task${n === 1 ? '' : 's'}`;
   }
 
   for (const val of Object.values(input)) {
@@ -160,7 +262,10 @@ function emit(text: string): void {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text }),
+      // Mark as tool-visibility so the chat-sdk-bridge accumulates these
+      // into a single edited message-bubble per thread (Telegram-style),
+      // rather than sending a new notification per tool call.
+      content: JSON.stringify({ text, _toolVis: true }),
     });
   } catch (err) {
     log(`emit failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -182,9 +287,7 @@ function flushBatch(toolName: string): void {
   const entry = toolBatch.get(toolName);
   if (!entry) return;
   toolBatch.delete(toolName);
-  const suffix = entry.lastDesc ? `: ${entry.lastDesc}` : '';
-  const countStr = entry.count > 1 ? ` ×${entry.count}` : '';
-  emit(`${entry.emoji} ${entry.label}${countStr}${suffix}`);
+  emit(formatToolLine(entry.emoji, entry.label, entry.lastDesc, entry.count));
 }
 
 function sendBatched(toolName: string, emoji: string, label: string, desc: string): void {
@@ -232,8 +335,7 @@ export const preToolUseVisibility: HookCallback = async (input, toolUseId) => {
   if (BATCH_TOOLS.has(toolName)) {
     sendBatched(toolName, emoji, label, desc);
   } else {
-    const text = desc ? `${emoji} ${label}: ${desc}` : `${emoji} ${label}`;
-    emit(text);
+    emit(formatToolLine(emoji, label, desc));
   }
 
   return { continue: true };
@@ -245,7 +347,15 @@ export const preToolUseVisibility: HookCallback = async (input, toolUseId) => {
  * out — the pre-hook message is enough signal.
  */
 export const postToolUseVisibility: HookCallback = async (input, toolUseId) => {
-  const i = input as { tool_name?: string; tool_use_id?: string; transcript_path?: string };
+  const i = input as {
+    hook_event_name?: string;
+    tool_name?: string;
+    tool_input?: unknown;
+    tool_response?: unknown;
+    error?: string;
+    tool_use_id?: string;
+    transcript_path?: string;
+  };
   if (typeof i.transcript_path === 'string' && i.transcript_path.includes('/subagents/')) {
     return { continue: true };
   }
@@ -257,10 +367,35 @@ export const postToolUseVisibility: HookCallback = async (input, toolUseId) => {
   const startTime = id ? toolStartTimes[id] : undefined;
   if (id) delete toolStartTimes[id];
 
+  const label = TOOL_LABEL[toolName] ?? toolName.toLowerCase();
+  const desc = describeToolInput(toolName, i.tool_input);
+
+  // FAILURE PATH 1 — explicit PostToolUseFailure event with `error` field.
+  if (i.hook_event_name === 'PostToolUseFailure') {
+    const reason = (i.error ?? 'failed').replace(/\s+/g, ' ').trim().slice(0, 80);
+    const merged = desc ? `${desc}  ✗ ${reason}` : `✗ ${reason}`;
+    emit(formatToolLine('❌', label, merged));
+    return { continue: true };
+  }
+
+  // FAILURE PATH 2 — heuristic detection from tool_response (some tools
+  // report errors in their normal response payload).
+  const inferred = detectFailureFromResponse(toolName, i.tool_response);
+  if (inferred) {
+    const merged = desc ? `${desc}  ✗ ${inferred}` : `✗ ${inferred}`;
+    emit(formatToolLine('❌', label, merged));
+    return { continue: true };
+  }
+
+  // SUCCESS PATH — emit done-marker for slow Bash, optionally enriched
+  // with a result-shape hint (line count, response size).
   if (toolName === 'Bash' && startTime) {
     const elapsed = Date.now() - startTime;
     if (elapsed > LONG_CALL_THRESHOLD_MS) {
-      emit(`🖥️ bash: done in ${(elapsed / 1000).toFixed(1)}s`);
+      const shape = resultShape(toolName, i.tool_response);
+      const elapsedStr = `done in ${(elapsed / 1000).toFixed(1)}s`;
+      const finalDesc = shape ? `${elapsedStr}  ${shape}` : elapsedStr;
+      emit(formatToolLine('🖥️', 'bash', finalDesc));
     }
   }
 
