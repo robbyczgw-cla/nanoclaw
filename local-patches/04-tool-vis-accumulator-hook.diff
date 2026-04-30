@@ -1,0 +1,14 @@
+--- container/agent-runner/src/hooks/tool-visibility.ts.bak-20260429-2049-vz	2026-04-29 20:49:55.600629366 +0000
++++ container/agent-runner/src/hooks/tool-visibility.ts	2026-04-29 20:49:55.618979458 +0000
+@@ -262,7 +262,10 @@
+       platform_id: routing.platform_id,
+       channel_type: routing.channel_type,
+       thread_id: routing.thread_id,
+-      content: JSON.stringify({ text }),
++      // Mark as tool-visibility so the chat-sdk-bridge accumulates these
++      // into a single edited message-bubble per thread (Telegram-style),
++      // rather than sending a new notification per tool call.
++      content: JSON.stringify({ text, _toolVis: true }),
+     });
+   } catch (err) {
+     log(`emit failed: ${err instanceof Error ? err.message : String(err)}`);

@@ -245,3 +245,19 @@ launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
 ```
 
 `container/build.sh` reads `INSTALL_CJK_FONTS` from `.env` and passes it through as a Docker build-arg. Without CJK fonts, Chromium-rendered screenshots and PDFs containing CJK text show tofu (empty rectangles) instead of characters.
+
+---
+
+## Local patches
+
+Source-code modifications under `/root/nanoclaw-v2/{src,container,setup,scripts}` are tracked in [`local-patches/README.md`](./local-patches/README.md). Each patch has a detailed `.md` write-up + a unified `.diff` + (where applicable) an idempotent apply-script.
+
+**After every `git pull` or `pnpm install`:**
+
+```bash
+bash /root/nanoclaw-v2/local-patches/verify.sh
+```
+
+If any patch shows ❌, follow the re-apply workflow in `local-patches/README.md`.
+
+**Currently active patches:** 3 (telegram maxTextLength, tool-visibility v0.x polish, tool-visibility v0.y failure-detection). See the README for upstream-PR status and per-patch reasoning.

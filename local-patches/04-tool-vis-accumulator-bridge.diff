@@ -1,0 +1,120 @@
+--- src/channels/chat-sdk-bridge.ts.bak-20260429-2049-vz	2026-04-29 20:49:55.602020630 +0000
++++ src/channels/chat-sdk-bridge.ts	2026-04-29 20:49:55.619279641 +0000
+@@ -117,7 +117,95 @@
+   return chunks;
+ }
+ 
++interface ToolVisAccumulator {
++  messageId: string;
++  lines: string[];
++  combinedLength: number;
++}
++
+ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
++  // In-memory map of open tool-visibility accumulators. Keyed by `${tid}:tool-vis`.
++  // Each entry tracks the original message_id + accumulated lines so we can
++  // edit-in-place rather than emit a new message per tool call.
++  // Cleared on the next non-tool-vis message to that thread (the agent's
++  // actual answer flushes the accumulator).
++  const toolVisAccumulators = new Map<string, ToolVisAccumulator>();
++
++  // Send a tool-visibility line into an accumulator. First line for a key
++  // creates a new message; subsequent lines edit that message in-place.
++  // Falls back to a fresh send if edit fails (rate limit, message gone,
++  // adapter doesn't support edit on this platform).
++  async function deliverToolVisAccumulator(
++    tid: string,
++    lineText: string,
++    accumKey: string,
++  ): Promise<string | undefined> {
++    const transformed = transformText(lineText);
++    const existing = toolVisAccumulators.get(accumKey);
++
++    if (!existing) {
++      // First emit for this accumulator — send fresh and remember the id.
++      const result = await adapter.postMessage(tid, { markdown: transformed });
++      const id = result?.id;
++      if (id) {
++        toolVisAccumulators.set(accumKey, {
++          messageId: id,
++          lines: [lineText],
++          combinedLength: lineText.length,
++        });
++      }
++      return id;
++    }
++
++    // Length guard — if the next line would push past the adapter's limit,
++    // close out the current accumulator and start a fresh one rather than
++    // truncating mid-call. Cheaper than tracking edits across split chunks.
++    const projected = existing.combinedLength + 1 + lineText.length;
++    if (config.maxTextLength && projected > config.maxTextLength) {
++      const result = await adapter.postMessage(tid, { markdown: transformed });
++      const id = result?.id;
++      if (id) {
++        toolVisAccumulators.set(accumKey, {
++          messageId: id,
++          lines: [lineText],
++          combinedLength: lineText.length,
++        });
++      }
++      return id;
++    }
++
++    // Edit the existing message with the combined text.
++    const combinedRaw = existing.lines.concat(lineText).join('\n');
++    try {
++      await adapter.editMessage(tid, existing.messageId, {
++        markdown: transformText(combinedRaw),
++      });
++      existing.lines.push(lineText);
++      existing.combinedLength = combinedRaw.length;
++      return existing.messageId;
++    } catch (err) {
++      // Edit failed — could be rate-limit, message-deleted, adapter without
++      // edit support, or unchanged-content. Fall back to a fresh send and
++      // restart the accumulator at this line.
++      log.warn('Tool-vis edit failed, falling back to fresh send', {
++        err: err instanceof Error ? err.message : String(err),
++        adapter: adapter.name,
++      });
++      const result = await adapter.postMessage(tid, { markdown: transformed });
++      const id = result?.id;
++      if (id) {
++        toolVisAccumulators.set(accumKey, {
++          messageId: id,
++          lines: [lineText],
++          combinedLength: lineText.length,
++        });
++      } else {
++        toolVisAccumulators.delete(accumKey);
++      }
++      return id;
++    }
++  }
++
+   const { adapter } = config;
+   const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
+   let chat: Chat;
+@@ -354,6 +442,21 @@
+       const tid = threadId ?? platformId;
+       const content = message.content as Record<string, unknown>;
+ 
++      // ── Tool-visibility accumulator ──────────────────────────────────
++      // Tool-call previews carry `_toolVis: true` (set by the agent
++      // container's tool-visibility hook). We accumulate these into a
++      // single message-bubble per thread by editing the original send
++      // rather than emitting a new notification per tool call.
++      const accumKey = `${tid}:tool-vis`;
++      if (content._toolVis === true) {
++        const lineText = (content.text as string) || '';
++        if (!lineText) return;
++        return await deliverToolVisAccumulator(tid, lineText, accumKey);
++      }
++      // Non-tool-vis message → close any open accumulator for this thread
++      // so the agent's actual answer renders as a separate bubble.
++      toolVisAccumulators.delete(accumKey);
++
+       if (content.operation === 'edit' && content.messageId) {
+         await adapter.editMessage(tid, content.messageId as string, {
+           markdown: transformText((content.text as string) || (content.markdown as string) || ''),

@@ -1,0 +1,89 @@
+--- container/agent-runner/src/hooks/tool-visibility.ts.bak-20260429-2005	2026-04-29 20:05:06.312648721 +0000
++++ container/agent-runner/src/hooks/tool-visibility.ts.bak-20260429-2018-vy	2026-04-29 20:18:04.779797529 +0000
+@@ -67,6 +67,26 @@
+   return s.length > MAX_INPUT_PREVIEW ? s.slice(0, MAX_INPUT_PREVIEW) + '…' : s;
+ }
+ 
++/** Extract domain from URL — keeps preview compact ("github.com" not full URL). */
++function domainOf(url: string): string {
++  return url.replace(/^https?:\/\//, '').split('/')[0];
++}
++
++/** Shorten long file paths from the start with an ellipsis prefix. */
++function shortPath(p: string, maxLen = 35): string {
++  if (p.length <= maxLen) return p;
++  return '…' + p.slice(-(maxLen - 1));
++}
++
++/** Format a tool message with verb-aligned label for easier scanning. */
++function formatToolLine(emoji: string, label: string, desc: string, count = 0): string {
++  const countStr = count > 1 ? ` ×${count}` : '';
++  // Pad label so descriptions align vertically across tool calls.
++  const paddedLabel = label.padEnd(8);
++  return desc ? `${emoji} ${paddedLabel}${countStr} ${desc}`.trimEnd()
++              : `${emoji} ${paddedLabel.trimEnd()}${countStr}`;
++}
++
+ /** Extract the meaningful part of a bash command for the preview. */
+ function summarizeBash(raw: string): string {
+   const cmd = raw.replace(/\s+/g, ' ').trim();
+@@ -117,7 +137,7 @@
+     return summarizeBash(input.command);
+   }
+   if ((toolName === 'Read' || toolName === 'Write' || toolName === 'Edit') && typeof input.file_path === 'string') {
+-    return input.file_path;
++    return shortPath(input.file_path);
+   }
+   if (toolName === 'Glob' && typeof input.pattern === 'string') {
+     return input.pattern;
+@@ -126,14 +146,18 @@
+     return input.pattern;
+   }
+   if (toolName === 'WebFetch' && typeof input.url === 'string') {
+-    return truncate(input.url);
++    return domainOf(input.url);
+   }
+   if (toolName === 'WebSearch' && typeof input.query === 'string') {
+-    return truncate(input.query);
++    return `"${truncate(input.query)}"`;
+   }
+   if (toolName === 'Task' && typeof input.description === 'string') {
+     return truncate(input.description);
+   }
++  if (toolName === 'TodoWrite' && Array.isArray(input.todos)) {
++    const n = input.todos.length;
++    return `${n} task${n === 1 ? '' : 's'}`;
++  }
+ 
+   for (const val of Object.values(input)) {
+     if (typeof val === 'string' && val.length > 0) {
+@@ -182,9 +206,7 @@
+   const entry = toolBatch.get(toolName);
+   if (!entry) return;
+   toolBatch.delete(toolName);
+-  const suffix = entry.lastDesc ? `: ${entry.lastDesc}` : '';
+-  const countStr = entry.count > 1 ? ` ×${entry.count}` : '';
+-  emit(`${entry.emoji} ${entry.label}${countStr}${suffix}`);
++  emit(formatToolLine(entry.emoji, entry.label, entry.lastDesc, entry.count));
+ }
+ 
+ function sendBatched(toolName: string, emoji: string, label: string, desc: string): void {
+@@ -232,8 +254,7 @@
+   if (BATCH_TOOLS.has(toolName)) {
+     sendBatched(toolName, emoji, label, desc);
+   } else {
+-    const text = desc ? `${emoji} ${label}: ${desc}` : `${emoji} ${label}`;
+-    emit(text);
++    emit(formatToolLine(emoji, label, desc));
+   }
+ 
+   return { continue: true };
+@@ -260,7 +281,7 @@
+   if (toolName === 'Bash' && startTime) {
+     const elapsed = Date.now() - startTime;
+     if (elapsed > LONG_CALL_THRESHOLD_MS) {
+-      emit(`🖥️ bash: done in ${(elapsed / 1000).toFixed(1)}s`);
++      emit(formatToolLine('🖥️', 'bash', `done in ${(elapsed / 1000).toFixed(1)}s`));
+     }
+   }
+ 

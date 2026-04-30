@@ -1,0 +1,167 @@
+--- container/agent-runner/src/hooks/tool-visibility.ts.bak-20260429-2018-vy	2026-04-29 20:18:04.779797529 +0000
++++ container/agent-runner/src/hooks/tool-visibility.ts	2026-04-29 20:18:04.795756658 +0000
+@@ -31,8 +31,9 @@
+ const TOOL_EMOJI: Record<string, string> = {
+   Bash: '🖥️',
+   Read: '📖',
+-  Write: '✏️',
++  Write: '✍️',
+   Edit: '✏️',
++  MultiEdit: '✏️',
+   WebFetch: '🌐',
+   WebSearch: '🌐',
+   Agent: '🤖',
+@@ -45,6 +46,7 @@
+   Read: 'read',
+   Write: 'write',
+   Edit: 'edit',
++  MultiEdit: 'edit',
+   WebFetch: 'fetch',
+   WebSearch: 'search',
+   Agent: 'agent',
+@@ -52,7 +54,7 @@
+   TodoWrite: 'todo',
+ };
+ 
+-const BATCH_TOOLS = new Set(['Read', 'Write', 'Edit', 'WebFetch']);
++const BATCH_TOOLS = new Set(['Read', 'Write', 'Edit', 'MultiEdit', 'WebFetch']);
+ 
+ const BASH_WITH_SUBCOMMAND = new Set([
+   'git', 'npm', 'pnpm', 'bun', 'apt', 'apt-get', 'pip', 'pip3',
+@@ -87,6 +89,82 @@
+               : `${emoji} ${paddedLabel.trimEnd()}${countStr}`;
+ }
+ 
++/**
++ * Try to extract a string output from a tool_response of unknown shape.
++ * Returns null if nothing string-y is found.
++ */
++function extractResponseText(toolResponse: unknown): string | null {
++  if (toolResponse == null) return null;
++  if (typeof toolResponse === 'string') return toolResponse;
++  if (typeof toolResponse === 'object') {
++    const r = toolResponse as Record<string, unknown>;
++    if (typeof r.output === 'string') return r.output;
++    if (typeof r.text === 'string') return r.text;
++    if (typeof r.content === 'string') return r.content;
++    if (typeof r.stdout === 'string') return r.stdout;
++  }
++  return null;
++}
++
++/**
++ * Compact post-completion result hint — line counts, response sizes, exit codes.
++ * Returns null when there's nothing interesting to add (avoids chat spam).
++ */
++function resultShape(toolName: string, toolResponse: unknown): string | null {
++  const text = extractResponseText(toolResponse);
++  if (toolName === 'Read' && text) {
++    const lines = text.split('\n').length;
++    return `${lines} lines`;
++  }
++  if (toolName === 'Bash' && text) {
++    const nonEmpty = text.split('\n').filter((l) => l.trim()).length;
++    if (nonEmpty >= 5) return `${nonEmpty} lines`;
++    return null;
++  }
++  if (toolName === 'WebFetch' && text) {
++    const kb = Math.round(text.length / 1024);
++    if (kb >= 1) return `${kb}KB`;
++    return null;
++  }
++  return null;
++}
++
++/**
++ * Heuristic failure detection from a normal PostToolUse response. Some tools
++ * report errors via the response payload rather than throwing — this catches
++ * those so we still emit the ❌ marker.
++ */
++function detectFailureFromResponse(_toolName: string, toolResponse: unknown): string | null {
++  if (toolResponse == null) return null;
++  if (typeof toolResponse === 'object') {
++    const r = toolResponse as Record<string, unknown>;
++    if (r.is_error === true || r.success === false) {
++      const explicit = typeof r.error === 'string' ? r.error
++        : typeof r.message === 'string' ? r.message
++        : 'failed';
++      return explicit.replace(/\s+/g, ' ').trim().slice(0, 80);
++    }
++    if (typeof r.error === 'string' && r.error.trim()) {
++      return r.error.replace(/\s+/g, ' ').trim().slice(0, 80);
++    }
++  }
++  const text = extractResponseText(toolResponse);
++  if (!text) return null;
++  // Pattern-based fallback. Conservative — only flag clear failures.
++  const patterns: RegExp[] = [
++    /^(Error|ERROR): (.+)$/m,
++    /(permission denied)/i,
++    /(no such file or directory)/i,
++    /(command not found)/i,
++    /(Traceback \(most recent call last\))/,
++  ];
++  for (const p of patterns) {
++    const m = text.match(p);
++    if (m) return m[0].replace(/\s+/g, ' ').trim().slice(0, 80);
++  }
++  return null;
++}
++
+ /** Extract the meaningful part of a bash command for the preview. */
+ function summarizeBash(raw: string): string {
+   const cmd = raw.replace(/\s+/g, ' ').trim();
+@@ -266,7 +344,15 @@
+  * out — the pre-hook message is enough signal.
+  */
+ export const postToolUseVisibility: HookCallback = async (input, toolUseId) => {
+-  const i = input as { tool_name?: string; tool_use_id?: string; transcript_path?: string };
++  const i = input as {
++    hook_event_name?: string;
++    tool_name?: string;
++    tool_input?: unknown;
++    tool_response?: unknown;
++    error?: string;
++    tool_use_id?: string;
++    transcript_path?: string;
++  };
+   if (typeof i.transcript_path === 'string' && i.transcript_path.includes('/subagents/')) {
+     return { continue: true };
+   }
+@@ -278,10 +364,35 @@
+   const startTime = id ? toolStartTimes[id] : undefined;
+   if (id) delete toolStartTimes[id];
+ 
++  const label = TOOL_LABEL[toolName] ?? toolName.toLowerCase();
++  const desc = describeToolInput(toolName, i.tool_input);
++
++  // FAILURE PATH 1 — explicit PostToolUseFailure event with `error` field.
++  if (i.hook_event_name === 'PostToolUseFailure') {
++    const reason = (i.error ?? 'failed').replace(/\s+/g, ' ').trim().slice(0, 80);
++    const merged = desc ? `${desc}  ✗ ${reason}` : `✗ ${reason}`;
++    emit(formatToolLine('❌', label, merged));
++    return { continue: true };
++  }
++
++  // FAILURE PATH 2 — heuristic detection from tool_response (some tools
++  // report errors in their normal response payload).
++  const inferred = detectFailureFromResponse(toolName, i.tool_response);
++  if (inferred) {
++    const merged = desc ? `${desc}  ✗ ${inferred}` : `✗ ${inferred}`;
++    emit(formatToolLine('❌', label, merged));
++    return { continue: true };
++  }
++
++  // SUCCESS PATH — emit done-marker for slow Bash, optionally enriched
++  // with a result-shape hint (line count, response size).
+   if (toolName === 'Bash' && startTime) {
+     const elapsed = Date.now() - startTime;
+     if (elapsed > LONG_CALL_THRESHOLD_MS) {
+-      emit(formatToolLine('🖥️', 'bash', `done in ${(elapsed / 1000).toFixed(1)}s`));
++      const shape = resultShape(toolName, i.tool_response);
++      const elapsedStr = `done in ${(elapsed / 1000).toFixed(1)}s`;
++      const finalDesc = shape ? `${elapsedStr}  ${shape}` : elapsedStr;
++      emit(formatToolLine('🖥️', 'bash', finalDesc));
+     }
+   }
+ 
