@@ -14,6 +14,8 @@ import type Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
+import { deriveAttachmentName } from './attachment-naming.js';
+import { isSafeAttachmentName } from './attachment-safety.js';
 import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -246,44 +248,6 @@ export function writeSessionMessage(
  * If message content has attachments with base64 `data`, save them to
  * the session's inbox directory and replace with `localPath`.
  */
-const MIME_TO_EXT: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp',
-  'image/gif': 'gif',
-  'image/heic': 'heic',
-  'audio/ogg': 'ogg',
-  'audio/mpeg': 'mp3',
-  'audio/wav': 'wav',
-  'audio/mp4': 'm4a',
-  'video/mp4': 'mp4',
-  'video/webm': 'webm',
-  'video/quicktime': 'mov',
-  'application/pdf': 'pdf',
-  'text/plain': 'txt',
-  'application/json': 'json',
-  'application/zip': 'zip',
-};
-
-// Fallback when mimeType is missing — Telegram photos and stickers arrive
-// without an explicit MIME on the attachment object. The `type` field
-// (from the channel bridge) is reliable enough to derive a canonical ext.
-const TYPE_TO_EXT: Record<string, string> = {
-  image: 'jpg',
-  photo: 'jpg',
-  sticker: 'webp',
-  voice: 'ogg',
-  audio: 'mp3',
-  video: 'mp4',
-  animation: 'mp4',
-};
-
-function extForMime(mime: string | undefined): string {
-  if (!mime) return '';
-  const clean = mime.split(';')[0].trim().toLowerCase();
-  return MIME_TO_EXT[clean] ?? '';
-}
-
 function extractAttachmentFiles(
   agentGroupId: string,
   sessionId: string,
@@ -303,18 +267,26 @@ function extractAttachmentFiles(
   let changed = false;
   for (const att of attachments) {
     if (typeof att.data === 'string') {
+      // The name field is attacker-controlled: chat platforms with E2E
+      // attachment encryption (WhatsApp, Matrix) cannot sanitize filename
+      // server-side, and other adapters pass att.name through raw. Without
+      // this guard, `path.join(inboxDir, '../../...')` writes anywhere the
+      // host process has fs permission — see Signal Desktop's Nov 2025
+      // attachment-fileName advisory for the same archetype.
+      const rawName = deriveAttachmentName(att);
+      const filename = isSafeAttachmentName(rawName) ? rawName : `attachment-${Date.now()}`;
+      if (filename !== rawName) {
+        log.warn('Refused unsafe attachment filename — would escape inbox', {
+          messageId,
+          rawName,
+          replacement: filename,
+        });
+      }
       const inboxDir = path.join(sessionDir(agentGroupId, sessionId), 'inbox', messageId);
       fs.mkdirSync(inboxDir, { recursive: true });
-      let filename = att.name as string | undefined;
-      if (!filename) {
-        let ext = extForMime(att.mimeType as string | undefined);
-        if (!ext && typeof att.type === 'string') {
-          ext = TYPE_TO_EXT[att.type.toLowerCase()] ?? '';
-        }
-        filename = ext ? `attachment-${Date.now()}.${ext}` : `attachment-${Date.now()}`;
-      }
       const filePath = path.join(inboxDir, filename);
       fs.writeFileSync(filePath, Buffer.from(att.data as string, 'base64'));
+      att.name = filename;
       att.localPath = `inbox/${messageId}/${filename}`;
       delete att.data;
       changed = true;
@@ -414,6 +386,11 @@ export function readOutboxFiles(
   if (!fs.existsSync(outboxDir)) return undefined;
   const files: OutboundFile[] = [];
   for (const filename of filenames) {
+    // Reject any name that isn't a bare basename before touching the filesystem.
+    if (!isSafeAttachmentName(filename)) {
+      log.warn('Refused unsafe outbox filename — would escape outbox', { messageId, filename });
+      continue;
+    }
     const filePath = path.join(outboxDir, filename);
     if (fs.existsSync(filePath)) {
       files.push({ filename, data: fs.readFileSync(filePath) });

@@ -225,9 +225,18 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 // ── Provider ──
 
 /**
- * Claude Code auto-compacts context at this window (tokens). Tuned for the
- * 1M-context Opus 4.7 variant — plenty of headroom before compaction.
- * Operator override: set CLAUDE_CODE_AUTO_COMPACT_WINDOW in the host env.
+ * Claude Code auto-compacts context at this window (tokens). Kept here so
+ * the generic bootstrap doesn't need to know about Claude-specific env vars.
+ *
+ * Operator override: set CLAUDE_CODE_AUTO_COMPACT_WINDOW in the host env to
+ * raise or lower the threshold without editing source — useful when running
+ * with a 1M-context model variant or when emergency-tuning a deployment.
+ *
+ * Local default: 900000 (90% of 1M, leaves 100k headroom). Tuned for the
+ * 1M-context Opus 4.7 variant set as model default below — without this
+ * override the SDK would compact at 16.5% of context every turn. Tracked
+ * as local-patches/ entry so future-Claude knows why we drift from
+ * upstream's 165000 here.
  */
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '900000';
 
