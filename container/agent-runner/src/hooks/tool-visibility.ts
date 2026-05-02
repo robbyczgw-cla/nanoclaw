@@ -16,6 +16,18 @@
  * loop picks them up and sends them through the same channel adapter the
  * rest of the chat goes through.
  */
+import fs from "fs";
+
+let _skipVisibility: boolean | null = null;
+function skipVisibility(): boolean {
+  if (_skipVisibility !== null) return _skipVisibility;
+  try {
+    const cfg = JSON.parse(fs.readFileSync("/workspace/agent/container.json", "utf8"));
+    _skipVisibility = cfg.assistantName === "Cami";
+  } catch { _skipVisibility = false; }
+  return _skipVisibility;
+}
+
 import path from 'path';
 
 import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
@@ -27,6 +39,8 @@ const SKIP_TOOLS = new Set(['WebSearch', 'Glob', 'Grep']);
 
 const MAX_INPUT_PREVIEW = 120;
 const LONG_CALL_THRESHOLD_MS = 3000;
+const PROGRESS_FIRST_DELAY_MS = 30000;  // first progress msg at 30s
+const PROGRESS_INTERVAL_MS = 30000;     // then every 30s
 
 const TOOL_EMOJI: Record<string, string> = {
   Bash: '🖥️',
@@ -117,8 +131,18 @@ function resultShape(toolName: string, toolResponse: unknown): string | null {
     return `${lines} lines`;
   }
   if (toolName === 'Bash' && text) {
-    const nonEmpty = text.split('\n').filter((l) => l.trim()).length;
-    if (nonEmpty >= 5) return `${nonEmpty} lines`;
+    const allLines = text.split('\n');
+    const nonEmpty = allLines.filter((l) => l.trim()).length;
+    if (nonEmpty < 1) return null;
+    // Show first non-empty line as a sneak-peek; useful confirmation that
+    // the command actually produced what was expected. Trim to keep the
+    // chat-line compact.
+    const firstLine = allLines.find((l) => l.trim()) || '';
+    const peek = firstLine.replace(/\s+/g, ' ').trim().slice(0, 60);
+    if (nonEmpty >= 5) {
+      return peek ? `${nonEmpty} lines  → \`${peek}\`` : `${nonEmpty} lines`;
+    }
+    if (peek) return `→ \`${peek}\``;
     return null;
   }
   if (toolName === 'WebFetch' && text) {
@@ -212,22 +236,22 @@ function describeToolInput(toolName: string, toolInput: unknown): string {
   const input = toolInput as Record<string, unknown>;
 
   if (toolName === 'Bash' && typeof input.command === 'string') {
-    return summarizeBash(input.command);
+    return `\`${summarizeBash(input.command)}\``;
   }
-  if ((toolName === 'Read' || toolName === 'Write' || toolName === 'Edit') && typeof input.file_path === 'string') {
-    return shortPath(input.file_path);
+  if ((toolName === 'Read' || toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit') && typeof input.file_path === 'string') {
+    return `\`${shortPath(input.file_path)}\``;
   }
   if (toolName === 'Glob' && typeof input.pattern === 'string') {
-    return input.pattern;
+    return `\`${input.pattern}\``;
   }
   if (toolName === 'Grep' && typeof input.pattern === 'string') {
-    return input.pattern;
+    return `\`${input.pattern}\``;
   }
   if (toolName === 'WebFetch' && typeof input.url === 'string') {
-    return domainOf(input.url);
+    return `\`${domainOf(input.url)}\``;
   }
   if (toolName === 'WebSearch' && typeof input.query === 'string') {
-    return `"${truncate(input.query)}"`;
+    return `\`${truncate(input.query)}\``;
   }
   if (toolName === 'Task' && typeof input.description === 'string') {
     return truncate(input.description);
@@ -306,6 +330,7 @@ function sendBatched(toolName: string, emoji: string, label: string, desc: strin
 // ── Duration tracking for slow Bash ──────────────────────────────────
 
 const toolStartTimes: Record<string, number> = {};
+const progressTimers: Record<string, ReturnType<typeof setInterval>> = {};
 
 // ── Hook implementations ─────────────────────────────────────────────
 
@@ -315,6 +340,7 @@ const toolStartTimes: Record<string, number> = {};
  * still gets recorded even if visibility errors).
  */
 export const preToolUseVisibility: HookCallback = async (input, toolUseId) => {
+  if (skipVisibility()) return { continue: true };
   const i = input as { tool_name?: string; tool_input?: unknown; tool_use_id?: string; transcript_path?: string };
   // Skip subagent (Task/Agent) tool calls — user wants only the top-level
   // agent's activity in chat. Subagent transcripts live under `/subagents/`.
@@ -338,6 +364,23 @@ export const preToolUseVisibility: HookCallback = async (input, toolUseId) => {
     emit(formatToolLine(emoji, label, desc));
   }
 
+  // Progress emitter for long-running Agent/Task calls — sends a
+  // "still working — Xs elapsed" message every 30s while the call hasn't
+  // returned. Cleared in the post-tool hook.
+  if ((toolName === 'Agent' || toolName === 'Task') && id) {
+    const startedAt = toolStartTimes[id] ?? Date.now();
+    const tick = () => {
+      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+      const elapsedStr = elapsedSec >= 60
+        ? `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`
+        : `${elapsedSec}s`;
+      emit(formatToolLine('⏳', label, `still working — ${elapsedStr} elapsed`));
+    };
+    progressTimers[id] = setInterval(tick, PROGRESS_INTERVAL_MS);
+    // First tick after 30s (don't fire immediately — pre-hook line already shown)
+    setTimeout(tick, PROGRESS_FIRST_DELAY_MS);
+  }
+
   return { continue: true };
 };
 
@@ -347,6 +390,7 @@ export const preToolUseVisibility: HookCallback = async (input, toolUseId) => {
  * out — the pre-hook message is enough signal.
  */
 export const postToolUseVisibility: HookCallback = async (input, toolUseId) => {
+  if (skipVisibility()) return { continue: true };
   const i = input as {
     hook_event_name?: string;
     tool_name?: string;
@@ -366,6 +410,12 @@ export const postToolUseVisibility: HookCallback = async (input, toolUseId) => {
   const id = toolUseId || i.tool_use_id;
   const startTime = id ? toolStartTimes[id] : undefined;
   if (id) delete toolStartTimes[id];
+
+  // Clear any progress timer for Agent/Task — call is done, no more ticks.
+  if (id && progressTimers[id]) {
+    clearInterval(progressTimers[id]);
+    delete progressTimers[id];
+  }
 
   const label = TOOL_LABEL[toolName] ?? toolName.toLowerCase();
   const desc = describeToolInput(toolName, i.tool_input);

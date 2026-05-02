@@ -1,0 +1,107 @@
+--- container/agent-runner/src/hooks/tool-visibility.ts.bak-20260430-0912-v1	2026-04-30 09:12:01.129715437 +0000
++++ container/agent-runner/src/hooks/tool-visibility.ts	2026-04-30 09:12:01.144856446 +0000
+@@ -27,6 +27,8 @@
+ 
+ const MAX_INPUT_PREVIEW = 120;
+ const LONG_CALL_THRESHOLD_MS = 3000;
++const PROGRESS_FIRST_DELAY_MS = 30000;  // first progress msg at 30s
++const PROGRESS_INTERVAL_MS = 30000;     // then every 30s
+ 
+ const TOOL_EMOJI: Record<string, string> = {
+   Bash: '🖥️',
+@@ -117,8 +119,18 @@
+     return `${lines} lines`;
+   }
+   if (toolName === 'Bash' && text) {
+-    const nonEmpty = text.split('\n').filter((l) => l.trim()).length;
+-    if (nonEmpty >= 5) return `${nonEmpty} lines`;
++    const allLines = text.split('\n');
++    const nonEmpty = allLines.filter((l) => l.trim()).length;
++    if (nonEmpty < 1) return null;
++    // Show first non-empty line as a sneak-peek; useful confirmation that
++    // the command actually produced what was expected. Trim to keep the
++    // chat-line compact.
++    const firstLine = allLines.find((l) => l.trim()) || '';
++    const peek = firstLine.replace(/\s+/g, ' ').trim().slice(0, 60);
++    if (nonEmpty >= 5) {
++      return peek ? `${nonEmpty} lines  → \`${peek}\`` : `${nonEmpty} lines`;
++    }
++    if (peek) return `→ \`${peek}\``;
+     return null;
+   }
+   if (toolName === 'WebFetch' && text) {
+@@ -212,22 +224,22 @@
+   const input = toolInput as Record<string, unknown>;
+ 
+   if (toolName === 'Bash' && typeof input.command === 'string') {
+-    return summarizeBash(input.command);
++    return `\`${summarizeBash(input.command)}\``;
+   }
+-  if ((toolName === 'Read' || toolName === 'Write' || toolName === 'Edit') && typeof input.file_path === 'string') {
+-    return shortPath(input.file_path);
++  if ((toolName === 'Read' || toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit') && typeof input.file_path === 'string') {
++    return `\`${shortPath(input.file_path)}\``;
+   }
+   if (toolName === 'Glob' && typeof input.pattern === 'string') {
+-    return input.pattern;
++    return `\`${input.pattern}\``;
+   }
+   if (toolName === 'Grep' && typeof input.pattern === 'string') {
+-    return input.pattern;
++    return `\`${input.pattern}\``;
+   }
+   if (toolName === 'WebFetch' && typeof input.url === 'string') {
+-    return domainOf(input.url);
++    return `\`${domainOf(input.url)}\``;
+   }
+   if (toolName === 'WebSearch' && typeof input.query === 'string') {
+-    return `"${truncate(input.query)}"`;
++    return `\`${truncate(input.query)}\``;
+   }
+   if (toolName === 'Task' && typeof input.description === 'string') {
+     return truncate(input.description);
+@@ -306,6 +318,7 @@
+ // ── Duration tracking for slow Bash ──────────────────────────────────
+ 
+ const toolStartTimes: Record<string, number> = {};
++const progressTimers: Record<string, ReturnType<typeof setInterval>> = {};
+ 
+ // ── Hook implementations ─────────────────────────────────────────────
+ 
+@@ -338,6 +351,23 @@
+     emit(formatToolLine(emoji, label, desc));
+   }
+ 
++  // Progress emitter for long-running Agent/Task calls — sends a
++  // "still working — Xs elapsed" message every 30s while the call hasn't
++  // returned. Cleared in the post-tool hook.
++  if ((toolName === 'Agent' || toolName === 'Task') && id) {
++    const startedAt = toolStartTimes[id] ?? Date.now();
++    const tick = () => {
++      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
++      const elapsedStr = elapsedSec >= 60
++        ? `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`
++        : `${elapsedSec}s`;
++      emit(formatToolLine('⏳', label, `still working — ${elapsedStr} elapsed`));
++    };
++    progressTimers[id] = setInterval(tick, PROGRESS_INTERVAL_MS);
++    // First tick after 30s (don't fire immediately — pre-hook line already shown)
++    setTimeout(tick, PROGRESS_FIRST_DELAY_MS);
++  }
++
+   return { continue: true };
+ };
+ 
+@@ -367,6 +397,12 @@
+   const startTime = id ? toolStartTimes[id] : undefined;
+   if (id) delete toolStartTimes[id];
+ 
++  // Clear any progress timer for Agent/Task — call is done, no more ticks.
++  if (id && progressTimers[id]) {
++    clearInterval(progressTimers[id]);
++    delete progressTimers[id];
++  }
++
+   const label = TOOL_LABEL[toolName] ?? toolName.toLowerCase();
+   const desc = describeToolInput(toolName, i.tool_input);
+ 

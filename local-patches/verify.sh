@@ -41,6 +41,15 @@ else
   ALL_OK=false
 fi
 
+
+# Patch 05 — tool-visibility v1.0 (bash preview + code-fence + iteration progress)
+if grep -q 'progressTimers' container/agent-runner/src/hooks/tool-visibility.ts 2>/dev/null    && grep -q 'PROGRESS_INTERVAL_MS' container/agent-runner/src/hooks/tool-visibility.ts 2>/dev/null; then
+  echo "✅ 05-tool-visibility-v1 applied"
+else
+  echo "❌ 05-tool-visibility-v1 MISSING"
+  ALL_OK=false
+fi
+
 echo
 if $ALL_OK; then
   echo "🦫 All patches present."

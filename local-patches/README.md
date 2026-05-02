@@ -14,6 +14,7 @@ This directory tracks every local source-code modification applied to `/root/nan
 | 02 | `container/agent-runner/src/hooks/tool-visibility.ts` | Tool-visibility v0.x polish | none (deferred) | 🟢 local-only |
 | 03 | `container/agent-runner/src/hooks/tool-visibility.ts` | Tool-visibility v0.y (failure + shape) | none (deferred) | 🟢 local-only |
 | 04 | `tool-visibility.ts` + `chat-sdk-bridge.ts` | Tool-vis accumulator (Telegram edit-in-place) | none (deferred) | 🟢 local-only |
+| 05 | `tool-visibility.ts` | Tool-vis v1.0 (bash preview + code-fence + iter progress) | none (deferred) | 🟢 local-only |
 
 **Apply order matters:** 02 must be applied before 03 — 03's apply-script anchors on strings introduced by 02. Patch 01 is independent of 02/03.
 
@@ -109,6 +110,7 @@ If any return 0, the patch was wiped — re-apply via the workflow above.
 
 ## History (newest first)
 
+- **2026-04-30 09:12** — Patch 05 applied (tool-vis v1.0: bash first-line peek + code-fence paths + Agent/Task iteration progress)
 - **2026-04-29 20:49** — Patch 04 applied (tool-vis accumulator: edit-in-place per thread, Telegram-style bubble)
 - **2026-04-29 20:18** — Patch 03 applied (tool-visibility v0.y: failure detection + result-shape + emoji split)
 - **2026-04-29 20:05** — Patch 02 applied (tool-visibility v0.x: domain extraction + path shortening + verb alignment + todo count)
