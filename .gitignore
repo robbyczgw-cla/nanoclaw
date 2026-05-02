@@ -39,3 +39,6 @@ groups/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# Runtime artefact (host creates this on first start; not source-of-truth)
+state.db
