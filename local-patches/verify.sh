@@ -50,6 +50,16 @@ else
   ALL_OK=false
 fi
 
+# Patch 06 — tool-visibility v1.1 (bash-prefix + task-suppress + cache-fix)
+if grep -q 'function isTaskSession' container/agent-runner/src/hooks/tool-visibility.ts 2>/dev/null \
+   && grep -q 'isPureAssignment' container/agent-runner/src/hooks/tool-visibility.ts 2>/dev/null \
+   && grep -q 'if (isTaskSession()) return' container/agent-runner/src/hooks/tool-visibility.ts 2>/dev/null; then
+  echo "✅ 06-tool-visibility-v1.1 applied"
+else
+  echo "❌ 06-tool-visibility-v1.1 MISSING (or partial — check isTaskSession + isPureAssignment + emit guard)"
+  ALL_OK=false
+fi
+
 echo
 if $ALL_OK; then
   echo "🦫 All patches present."

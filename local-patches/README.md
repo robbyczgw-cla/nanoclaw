@@ -15,6 +15,7 @@ This directory tracks every local source-code modification applied to `/root/nan
 | 03 | `container/agent-runner/src/hooks/tool-visibility.ts` | Tool-visibility v0.y (failure + shape) | none (deferred) | 🟢 local-only |
 | 04 | `tool-visibility.ts` + `chat-sdk-bridge.ts` | Tool-vis accumulator (Telegram edit-in-place) | none (deferred) | 🟢 local-only |
 | 05 | `tool-visibility.ts` | Tool-vis v1.0 (bash preview + code-fence + iter progress) | none (deferred) | 🟢 local-only |
+| 06 | `tool-visibility.ts` | Tool-vis v1.1 (bash-prefix + task-suppress + cache-fix) | none (deferred) | 🟢 local-only |
 
 **Apply order matters:** 02 must be applied before 03 — 03's apply-script anchors on strings introduced by 02. Patch 01 is independent of 02/03.
 
@@ -110,8 +111,31 @@ If any return 0, the patch was wiped — re-apply via the workflow above.
 
 ## History (newest first)
 
+- **2026-05-10 22:25** — Patch 06 applied (tool-vis v1.1: bash-prefix + task-suppress + cache-fix bundle, accumulated 2026-05-03 → 2026-05-07)
 - **2026-04-30 09:12** — Patch 05 applied (tool-vis v1.0: bash first-line peek + code-fence paths + Agent/Task iteration progress)
 - **2026-04-29 20:49** — Patch 04 applied (tool-vis accumulator: edit-in-place per thread, Telegram-style bubble)
 - **2026-04-29 20:18** — Patch 03 applied (tool-visibility v0.y: failure detection + result-shape + emoji split)
 - **2026-04-29 20:05** — Patch 02 applied (tool-visibility v0.x: domain extraction + path shortening + verb alignment + todo count)
 - **2026-04-29 14:14** — Patch 01 applied (telegram maxTextLength wiring) — opened upstream PR #2112 same day
+
+---
+
+## Sibling installations on nanoclaw-host (Andy-owned)
+
+These are **separate projects** installed on the nanoclaw-host filesystem alongside (not inside) `/root/nanoclaw-v2`. They survive nanoclaw-v2 framework updates by virtue of living outside this tree, but they need to exist + be backed up + be recoverable from disaster. Tracked here for inventory + recovery awareness, not as patches.
+
+| Path | Service | Purpose | Backed-up? |
+|---|---|---|---|
+| `/opt/andy-dashboard/` | `andy-dashboard.service` | Andy infrastructure dashboard, port 3333 | ✅ agents-andy bundle |
+| `/root/api-server/` | `andy-api-server.service` | ask-andy HTTP API, port 8643 | ✅ agents-andy bundle |
+| `/opt/codex-imagegen-mcp/` | bundled | ChatGPT-Plus image gen wrapper | ✅ agents-andy bundle |
+| `/opt/nanoclaw-video/` | (CLI) | Pillow + ffmpeg video renderer (Phase 1-5) | ✅ agents-andy (since 2026-05-10) |
+| `/opt/deepgram-cli/` | (CLI) | Deepgram TTS + STT module | ✅ agents-andy (since 2026-05-10) |
+| `/etc/systemd/system/nanoclaw-services.service` | `nanoclaw-services` | HTTP API on port 8650 (render-video, tts, stt) | ⚠️ Phase 5 — pending Hermi follow-up |
+| `/usr/local/bin/{nanoclaw-video,deepgram-tts,deepgram-stt}` | bash wrappers | first-class CLI in PATH | ✅ agents-andy (since 2026-05-10) |
+| `/root/.deepgram-api-key` | secret | Deepgram TTS+STT auth | ✅ agents-andy-secrets bundle |
+| `/root/.nanoclaw-services-token` | secret | Bearer token for nanoclaw-services API | ⚠️ Phase 5 — pending Hermi follow-up |
+
+Bootstrap-from-scratch script for sibling installations: `/root/.hermes/scripts/restore_andy_host_tools.sh` (Hermi-owned, runs apt deps + recreates venvs).
+
+These are documented here so future-Claude knows the **full surface** of what's installed on this host without having to grep across the filesystem.

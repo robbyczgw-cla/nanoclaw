@@ -34,6 +34,22 @@ import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
 
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
+import { getInboundDb } from '../db/connection.js';
+
+// Detect whether this agent turn was triggered by a scheduled-task wake-up
+// (vs. an interactive chat message). Scheduled tasks often run with explicit
+// silent-on-OK behavior — leaking tool-call previews to chat creates orphan-
+// notification noise without context. We re-query on every call (no cache):
+// the per-process cache pattern was buggy — first invocation locked the value
+// for the container lifetime, so any task-cron firing later than the first
+// chat-message would be misclassified as a non-task session.
+function isTaskSession(): boolean {
+  try {
+    const db = getInboundDb();
+    const row = db.prepare("SELECT kind FROM messages_in ORDER BY seq DESC LIMIT 1").get() as { kind?: string } | undefined;
+    return row?.kind === 'task';
+  } catch { return false; }
+}
 
 const SKIP_TOOLS = new Set(['WebSearch', 'Glob', 'Grep']);
 
@@ -192,13 +208,29 @@ function detectFailureFromResponse(_toolName: string, toolResponse: unknown): st
 /** Extract the meaningful part of a bash command for the preview. */
 function summarizeBash(raw: string): string {
   const cmd = raw.replace(/\s+/g, ' ').trim();
-  const first = cmd.split(/\s*(?:&&|\|\||;|\|)\s*/)[0].trim();
+
+  // Split into segments by command connectors and skip ones that are pure
+  // variable-assignment blocks (e.g. `SSHK="ssh -i ..."` before `&& $SSHK ...`).
+  // Without this, long ssh-wrapper assignments at the start eat the whole preview.
+  const segments = cmd.split(/\s*(?:&&|\|\||;|\|)\s*/).map(s => s.trim()).filter(Boolean);
+  const isPureAssignment = (s: string) =>
+    /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s*)+$/.test(s);
+  let first = segments[0] ?? '';
+  for (const seg of segments) {
+    if (isPureAssignment(seg)) continue;
+    // Also strip leading inline `VAR=value VAR2=value cmd ...` assignments
+    first = seg.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, '');
+    break;
+  }
+
   const stripped = first.replace(/^sudo\s+/, '');
   const words = stripped.split(' ');
   const bin = path.basename(words[0] ?? '');
   const sub = words[1] ?? '';
 
-  if (bin === 'ssh') {
+  // Treat `$VAR root@host …` as ssh-like — common pattern for SSH-key-bundle aliases.
+  const isSshLike = bin === 'ssh' || /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(words[0] ?? '');
+  if (isSshLike) {
     // Skip leading flags so we don't mistake `-i` / `-o` / etc. for the host.
     // Flags that take an argument consume the next word too.
     const sshFlagsWithArg = new Set(['-i', '-o', '-p', '-J', '-F', '-L', '-R', '-D', '-l', '-c', '-m', '-b', '-B', '-e', '-I', '-Q', '-S', '-W', '-w']);
@@ -274,6 +306,10 @@ function describeToolInput(toolName: string, toolInput: unknown): string {
  * is swallowed so a broken hook can never kill the agent turn.
  */
 function emit(text: string): void {
+  // Scheduled-task sessions: suppress tool-vis entirely. Orphan tool-call
+  // previews leak into chat without context when the agent stays silent
+  // on a successful "all OK" check — pure noise to the user.
+  if (isTaskSession()) return;
   try {
     const routing = getSessionRouting();
     if (!routing.channel_type || !routing.platform_id) {
