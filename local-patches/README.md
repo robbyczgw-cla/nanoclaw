@@ -136,6 +136,7 @@ These are **separate projects** installed on the nanoclaw-host filesystem alongs
 | `/usr/local/bin/{nanoclaw-video,deepgram-tts,deepgram-stt}` | bash wrappers | first-class CLI in PATH | ✅ agents-andy (since 2026-05-10) |
 | `/root/.deepgram-api-key` | secret | Deepgram TTS+STT auth | ✅ agents-andy-secrets bundle |
 | `/root/.nanoclaw-services-token` | secret | Bearer token for nanoclaw-services API | ⚠️ Phase 5 — pending Hermi follow-up |
+| `/root/scripts/pull-shared-md-to-andy.sh` | crontab `10 * * * *` | Hourly mirror pull canonical (hermi) → Andy group dir | ⚠️ script-only, no data — recoverable from this README |
 
 Bootstrap-from-scratch script for sibling installations: `/root/.hermes/scripts/restore_andy_host_tools.sh` (Hermi-owned, runs apt deps + recreates venvs).
 
