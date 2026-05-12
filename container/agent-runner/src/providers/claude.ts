@@ -303,9 +303,8 @@ export class ClaudeProvider implements AgentProvider {
           ...Object.keys(this.mcpServers).map(mcpAllowPattern),
         ],
         disallowedTools: SDK_DISALLOWED_TOOLS,
-        model: process.env.ANTHROPIC_MODEL || 'claude-opus-4-7[1m]',
         env: this.env,
-        model: this.model,
+        model: this.model ?? process.env.ANTHROPIC_MODEL ?? 'claude-opus-4-7[1m]',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         effort: this.effort as any,
         permissionMode: 'bypassPermissions',

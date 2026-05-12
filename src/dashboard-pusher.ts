@@ -17,7 +17,8 @@ import { getUserRoles, getAdminsOfAgentGroup } from './modules/permissions/db/us
 import { getUserDmsForUser } from './modules/permissions/db/user-dms.js';
 import { getActiveAdapters, getRegisteredChannelNames } from './channels/channel-registry.js';
 import { DATA_DIR, ASSISTANT_NAME } from './config.js';
-import { readContainerConfig } from './container-config.js';
+import { configFromDb } from './container-config.js';
+import { getContainerConfig } from './db/container-configs.js';
 import { getDb } from './db/connection.js';
 import { log } from './log.js';
 
@@ -174,7 +175,10 @@ function collectAgentGroups() {
       agent_provider: g.agent_provider,
       container_config: (() => {
         try {
-          return readContainerConfig(g.folder);
+          const row = getContainerConfig(g.id);
+          const group = getAgentGroup(g.id);
+          if (!row || !group) return null;
+          return configFromDb(row, group);
         } catch {
           return null;
         }
