@@ -394,6 +394,13 @@ export const preToolUseVisibility: HookCallback = async (input, toolUseId) => {
   const emoji = TOOL_EMOJI[toolName] ?? '🔧';
   const label = TOOL_LABEL[toolName] ?? toolName.toLowerCase();
 
+  // Patch 07 — suppress empty TodoWrite calls (e.g. clearing stale todos).
+  // `📝 todo · 0 tasks` is pure noise; conveys no semantic information.
+  if (toolName === 'TodoWrite') {
+    const todos = (i.tool_input as { todos?: unknown[] } | undefined)?.todos;
+    if (Array.isArray(todos) && todos.length === 0) return { continue: true };
+  }
+
   if (BATCH_TOOLS.has(toolName)) {
     sendBatched(toolName, emoji, label, desc);
   } else {

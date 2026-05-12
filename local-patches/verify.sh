@@ -61,6 +61,14 @@ else
 fi
 
 echo
+
+# Patch 07 — empty TodoWrite suppress (anchor: comment + early-return)
+if grep -q "Patch 07 — suppress empty TodoWrite" container/agent-runner/src/hooks/tool-visibility.ts 2>/dev/null; then
+  echo "✅ 07-empty-todowrite-suppress applied"
+else
+  echo "❌ 07-empty-todowrite-suppress MISSING"
+  ALL_OK=false
+fi
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

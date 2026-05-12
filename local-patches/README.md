@@ -16,6 +16,7 @@ This directory tracks every local source-code modification applied to `/root/nan
 | 04 | `tool-visibility.ts` + `chat-sdk-bridge.ts` | Tool-vis accumulator (Telegram edit-in-place) | none (deferred) | 🟢 local-only |
 | 05 | `tool-visibility.ts` | Tool-vis v1.0 (bash preview + code-fence + iter progress) | none (deferred) | 🟢 local-only |
 | 06 | `tool-visibility.ts` | Tool-vis v1.1 (bash-prefix + task-suppress + cache-fix) | none (deferred) | 🟢 local-only |
+| 07 | `tool-visibility.ts` | Empty TodoWrite suppress (`📝 todo · 0 tasks` noise) | none (deferred) | 🟢 local-only |
 
 **Apply order matters:** 02 must be applied before 03 — 03's apply-script anchors on strings introduced by 02. Patch 01 is independent of 02/03.
 
