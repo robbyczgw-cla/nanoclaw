@@ -26,7 +26,7 @@ NanoClaw provides that same core functionality, but in a codebase small enough t
 ## Quick Start
 
 ```bash
-git clone https://github.com/qwibitai/nanoclaw.git nanoclaw-v2
+git clone https://github.com/nanocoai/nanoclaw.git nanoclaw-v2
 cd nanoclaw-v2
 bash nanoclaw.sh
 ```
@@ -39,7 +39,7 @@ bash nanoclaw.sh
 Run from a fresh v2 checkout next to your v1 install:
 
 ```bash
-git clone https://github.com/qwibitai/nanoclaw.git nanoclaw-v2
+git clone https://github.com/nanocoai/nanoclaw.git nanoclaw-v2
 cd nanoclaw-v2
 bash migrate-v2.sh
 ```
@@ -215,3 +215,5 @@ See [CHANGELOG.md](CHANGELOG.md) for breaking changes, or the [full release hist
 ## License
 
 MIT
+
+<img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=47894bd5-353b-42fe-bb97-74144e6df0bf" />

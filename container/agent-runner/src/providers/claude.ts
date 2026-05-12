@@ -35,7 +35,11 @@ const SDK_DISALLOWED_TOOLS = [
   'ExitWorktree',
 ];
 
-// Tool allowlist for NanoClaw agent containers
+// Tool allowlist for NanoClaw agent containers. MCP-tool entries are derived
+// at the call site from the registered `mcpServers` map so that any server
+// added via `add_mcp_server` (or wired in container.json directly) is
+// reachable to the agent — without this, the SDK's allowedTools filter
+// silently drops every MCP namespace not listed here.
 const TOOL_ALLOWLIST = [
   'Bash',
   'Read',
@@ -55,9 +59,14 @@ const TOOL_ALLOWLIST = [
   'ToolSearch',
   'Skill',
   'NotebookEdit',
-  'mcp__nanoclaw__*',
-  'mcp__codex-imagegen__*',
 ];
+
+// MCP server names are sanitized by the SDK when forming tool prefixes:
+// any character outside [A-Za-z0-9_-] becomes '_'. Mirror that here so our
+// allowlist patterns match what the SDK actually exposes.
+function mcpAllowPattern(serverName: string): string {
+  return `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '_')}__*`;
+}
 
 interface SDKUserMessage {
   type: 'user';
@@ -255,11 +264,15 @@ export class ClaudeProvider implements AgentProvider {
   private mcpServers: Record<string, McpServerConfig>;
   private env: Record<string, string | undefined>;
   private additionalDirectories?: string[];
+  private model?: string;
+  private effort?: string;
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
     this.additionalDirectories = options.additionalDirectories;
+    this.model = options.model;
+    this.effort = options.effort;
     this.env = {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
@@ -285,10 +298,16 @@ export class ClaudeProvider implements AgentProvider {
         resume: input.continuation,
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
-        allowedTools: TOOL_ALLOWLIST,
+        allowedTools: [
+          ...TOOL_ALLOWLIST,
+          ...Object.keys(this.mcpServers).map(mcpAllowPattern),
+        ],
         disallowedTools: SDK_DISALLOWED_TOOLS,
         model: process.env.ANTHROPIC_MODEL || 'claude-opus-4-7[1m]',
         env: this.env,
+        model: this.model,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        effort: this.effort as any,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],
