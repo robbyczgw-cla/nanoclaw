@@ -74,6 +74,15 @@ export interface ChatSdkBridgeConfig {
    * and reactions still target the head of the reply.
    */
   maxTextLength?: number;
+  /**
+   * Maximum caption length when sending text + files together. Telegram's
+   * `sendDocument.caption` field is capped at 1024 chars by the upstream
+   * Telegram Bot API. Without this, captions longer than 1024 chars are
+   * silently truncated by Telegram itself — even when `maxTextLength` would
+   * otherwise split safely. The bridge uses this to size the first chunk
+   * (which rides as the caption) tighter than the rest.
+   */
+  maxCaptionLength?: number;
 }
 
 /**
@@ -101,6 +110,29 @@ function resolveSelectedOption(
     if (render.options[idx]) return render.options[idx].value;
   }
   return candidate;
+}
+
+/**
+ * Per-thread outbound queue. When the agent emits multiple `<message>`
+ * blocks in one response, the host fires separate `send_message` tool
+ * calls that can run in parallel; Telegram's per-chat send rate (~1 msg/sec
+ * sustained) then silently drops some sends. The queue serializes outbound
+ * deliveries per chat without blocking other chats, with a small pacing
+ * delay so consecutive sends fall under the rate cap.
+ */
+const outboundQueues = new Map<string, Promise<unknown>>();
+const OUTBOUND_PACING_MS = 200;
+
+function enqueueOutbound<T>(tid: string, fn: () => Promise<T>): Promise<T> {
+  const prev = outboundQueues.get(tid) ?? Promise.resolve();
+  const next = prev.then(() => new Promise<void>((r) => setTimeout(r, OUTBOUND_PACING_MS))).then(fn);
+  // Swallow rejection in the chain so subsequent enqueues still proceed,
+  // but the returned promise still rejects for the caller.
+  outboundQueues.set(
+    tid,
+    next.catch(() => {}),
+  );
+  return next;
 }
 
 export function splitForLimit(text: string, limit: number): string[] {
@@ -457,156 +489,176 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // platformId is already in the adapter's encoded format (e.g. "telegram:6037840640",
       // "discord:guildId:channelId") — use it directly as the thread ID
       const tid = threadId ?? platformId;
-      const content = message.content as Record<string, unknown>;
+      // PATCH 08: serialize outbound per-thread to avoid Telegram's per-chat
+      // rate limit silently dropping bursts when the agent emits multiple
+      // messages in one response.
+      return enqueueOutbound(tid, async () => {
+        const content = message.content as Record<string, unknown>;
 
-      // ── Tool-visibility accumulator ──────────────────────────────────
-      // Tool-call previews carry `_toolVis: true` (set by the agent
-      // container's tool-visibility hook). We accumulate these into a
-      // single message-bubble per thread by editing the original send
-      // rather than emitting a new notification per tool call.
-      const accumKey = `${tid}:tool-vis`;
-      if (content._toolVis === true) {
-        const lineText = (content.text as string) || '';
-        if (!lineText) return;
-        return await deliverToolVisAccumulator(tid, lineText, accumKey);
-      }
-      // Non-tool-vis message → close any open accumulator for this thread
-      // so the agent's actual answer renders as a separate bubble.
-      toolVisAccumulators.delete(accumKey);
+        // ── Tool-visibility accumulator ──────────────────────────────────
+        // Tool-call previews carry `_toolVis: true` (set by the agent
+        // container's tool-visibility hook). We accumulate these into a
+        // single message-bubble per thread by editing the original send
+        // rather than emitting a new notification per tool call.
+        const accumKey = `${tid}:tool-vis`;
+        if (content._toolVis === true) {
+          const lineText = (content.text as string) || '';
+          if (!lineText) return;
+          return await deliverToolVisAccumulator(tid, lineText, accumKey);
+        }
+        // Non-tool-vis message → close any open accumulator for this thread
+        // so the agent's actual answer renders as a separate bubble.
+        toolVisAccumulators.delete(accumKey);
 
-      if (content.operation === 'edit' && content.messageId) {
-        await adapter.editMessage(tid, content.messageId as string, {
-          markdown: transformText((content.text as string) || (content.markdown as string) || ''),
-        });
-        return;
-      }
-
-      if (content.operation === 'reaction' && content.messageId && content.emoji) {
-        await adapter.addReaction(tid, content.messageId as string, content.emoji as string);
-        return;
-      }
-
-      // Ask question card — render as Card with buttons
-      if (content.type === 'ask_question' && content.questionId && content.options) {
-        const questionId = content.questionId as string;
-        const title = content.title as string;
-        const question = content.question as string;
-        if (!title) {
-          log.error('ask_question missing required title — skipping delivery', { questionId });
+        if (content.operation === 'edit' && content.messageId) {
+          await adapter.editMessage(tid, content.messageId as string, {
+            markdown: transformText((content.text as string) || (content.markdown as string) || ''),
+          });
           return;
         }
-        const options: NormalizedOption[] = normalizeOptions(content.options as never);
-        const card = Card({
-          title,
-          children: [
-            CardText(question),
-            Actions(
-              // Encode button id/value with the option index rather than the
-              // full value. Telegram caps callback_data at 64 bytes, and
-              // long values (e.g. ISO datetimes, URLs) push the JSON payload
-              // well past that. The onAction handlers resolve the index back
-              // to the real value via getAskQuestionRender(questionId).
-              options.map((opt, idx) =>
-                Button({ id: `ncq:${questionId}:${idx}`, label: opt.label, value: String(idx) }),
-              ),
-            ),
-          ],
-        });
-        const result = await adapter.postMessage(tid, {
-          card,
-          fallbackText: `${title}\n\n${question}\nOptions: ${options.map((o) => o.label).join(', ')}`,
-        });
-        return result?.id;
-      }
 
-      // Display card (send_card MCP tool) — returns immediately, no callback flow.
-      // Non-URL actions are dropped: send_card's contract is fire-and-forget, so a
-      // callback button would have nowhere to land. URL actions render as link buttons.
-      if (content.type === 'card' && content.card && typeof content.card === 'object') {
-        const cardSpec = content.card as Record<string, unknown>;
-        const title = (cardSpec.title as string) || '';
-        const fallbackText = (content.fallbackText as string) || (cardSpec.description as string) || title || '';
-
-        const cardChildren: CardChild[] = [];
-        if (typeof cardSpec.description === 'string' && cardSpec.description) {
-          cardChildren.push(CardText(cardSpec.description));
+        if (content.operation === 'reaction' && content.messageId && content.emoji) {
+          await adapter.addReaction(tid, content.messageId as string, content.emoji as string);
+          return;
         }
-        if (Array.isArray(cardSpec.children)) {
-          for (const child of cardSpec.children) {
-            if (typeof child === 'string' && child) {
-              cardChildren.push(CardText(child));
-            } else if (
-              child &&
-              typeof child === 'object' &&
-              typeof (child as Record<string, unknown>).text === 'string'
-            ) {
-              cardChildren.push(CardText((child as Record<string, string>).text));
+
+        // Ask question card — render as Card with buttons
+        if (content.type === 'ask_question' && content.questionId && content.options) {
+          const questionId = content.questionId as string;
+          const title = content.title as string;
+          const question = content.question as string;
+          if (!title) {
+            log.error('ask_question missing required title — skipping delivery', { questionId });
+            return;
+          }
+          const options: NormalizedOption[] = normalizeOptions(content.options as never);
+          const card = Card({
+            title,
+            children: [
+              CardText(question),
+              Actions(
+                // Encode button id/value with the option index rather than the
+                // full value. Telegram caps callback_data at 64 bytes, and
+                // long values (e.g. ISO datetimes, URLs) push the JSON payload
+                // well past that. The onAction handlers resolve the index back
+                // to the real value via getAskQuestionRender(questionId).
+                options.map((opt, idx) =>
+                  Button({ id: `ncq:${questionId}:${idx}`, label: opt.label, value: String(idx) }),
+                ),
+              ),
+            ],
+          });
+          const result = await adapter.postMessage(tid, {
+            card,
+            fallbackText: `${title}\n\n${question}\nOptions: ${options.map((o) => o.label).join(', ')}`,
+          });
+          return result?.id;
+        }
+
+        // Display card (send_card MCP tool) — returns immediately, no callback flow.
+        // Non-URL actions are dropped: send_card's contract is fire-and-forget, so a
+        // callback button would have nowhere to land. URL actions render as link buttons.
+        if (content.type === 'card' && content.card && typeof content.card === 'object') {
+          const cardSpec = content.card as Record<string, unknown>;
+          const title = (cardSpec.title as string) || '';
+          const fallbackText = (content.fallbackText as string) || (cardSpec.description as string) || title || '';
+
+          const cardChildren: CardChild[] = [];
+          if (typeof cardSpec.description === 'string' && cardSpec.description) {
+            cardChildren.push(CardText(cardSpec.description));
+          }
+          if (Array.isArray(cardSpec.children)) {
+            for (const child of cardSpec.children) {
+              if (typeof child === 'string' && child) {
+                cardChildren.push(CardText(child));
+              } else if (
+                child &&
+                typeof child === 'object' &&
+                typeof (child as Record<string, unknown>).text === 'string'
+              ) {
+                cardChildren.push(CardText((child as Record<string, string>).text));
+              }
             }
           }
-        }
-        if (Array.isArray(cardSpec.actions)) {
-          const linkButtons = (cardSpec.actions as Array<Record<string, unknown>>)
-            .filter((a) => typeof a.url === 'string' && a.url && typeof a.label === 'string' && a.label)
-            .map((a) => {
-              const style = a.style;
-              const safeStyle: 'primary' | 'danger' | 'default' | undefined =
-                style === 'primary' || style === 'danger' || style === 'default' ? style : undefined;
-              return LinkButton({
-                label: a.label as string,
-                url: a.url as string,
-                style: safeStyle,
+          if (Array.isArray(cardSpec.actions)) {
+            const linkButtons = (cardSpec.actions as Array<Record<string, unknown>>)
+              .filter((a) => typeof a.url === 'string' && a.url && typeof a.label === 'string' && a.label)
+              .map((a) => {
+                const style = a.style;
+                const safeStyle: 'primary' | 'danger' | 'default' | undefined =
+                  style === 'primary' || style === 'danger' || style === 'default' ? style : undefined;
+                return LinkButton({
+                  label: a.label as string,
+                  url: a.url as string,
+                  style: safeStyle,
+                });
               });
-            });
-          if (linkButtons.length > 0) {
-            cardChildren.push(Actions(linkButtons));
+            if (linkButtons.length > 0) {
+              cardChildren.push(Actions(linkButtons));
+            }
           }
+
+          if (cardChildren.length === 0 && !title) {
+            log.warn('send_card payload empty, skipping delivery');
+            return;
+          }
+
+          const card = Card({ title, children: cardChildren });
+          const result = await adapter.postMessage(tid, { card, fallbackText });
+          return result?.id;
         }
 
-        if (cardChildren.length === 0 && !title) {
-          log.warn('send_card payload empty, skipping delivery');
-          return;
+        // Normal message
+        const rawText = (content.markdown as string) || (content.text as string);
+        const text = rawText ? transformText(rawText) : rawText;
+        if (text) {
+          // Attach files if present (FileUpload format: { data, filename })
+          const fileUploads = message.files?.map((f: { data: Buffer; filename: string }) => ({
+            data: f.data,
+            filename: f.filename,
+          }));
+          // PATCH 08: caption-aware chunking. When files are attached, the
+          // first chunk rides as a file caption (Telegram sendDocument.caption:
+          // 1024 char limit), which is tighter than the regular sendMessage.text
+          // limit (4096). Use maxCaptionLength for the first chunk when files
+          // are present, maxTextLength for the rest.
+          const hasFiles = !!fileUploads && fileUploads.length > 0;
+          const firstChunkLimit = hasFiles && config.maxCaptionLength ? config.maxCaptionLength : config.maxTextLength;
+          const restChunkLimit = config.maxTextLength;
+          let chunks: string[];
+          if (firstChunkLimit && text.length > firstChunkLimit) {
+            const head = splitForLimit(text, firstChunkLimit)[0];
+            const tail = text.slice(head.length).replace(/^\s+/, '');
+            const tailChunks = tail
+              ? restChunkLimit && tail.length > restChunkLimit
+                ? splitForLimit(tail, restChunkLimit)
+                : [tail]
+              : [];
+            chunks = [head, ...tailChunks];
+          } else {
+            chunks = [text];
+          }
+          let firstId: string | undefined;
+          for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
+            const result = await adapter.postMessage(
+              tid,
+              attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
+            );
+            if (i === 0) firstId = result?.id;
+          }
+          return firstId;
+        } else if (message.files && message.files.length > 0) {
+          // Files only, no text
+          const fileUploads = message.files.map((f: { data: Buffer; filename: string }) => ({
+            data: f.data,
+            filename: f.filename,
+          }));
+          const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
+          return result?.id;
         }
-
-        const card = Card({ title, children: cardChildren });
-        const result = await adapter.postMessage(tid, { card, fallbackText });
-        return result?.id;
-      }
-
-      // Normal message
-      const rawText = (content.markdown as string) || (content.text as string);
-      const text = rawText ? transformText(rawText) : rawText;
-      if (text) {
-        // Attach files if present (FileUpload format: { data, filename })
-        const fileUploads = message.files?.map((f: { data: Buffer; filename: string }) => ({
-          data: f.data,
-          filename: f.filename,
-        }));
-        // Split if over the adapter's max length. Files ride on the first
-        // chunk so the head of the reply still carries them.
-        const chunks =
-          config.maxTextLength && text.length > config.maxTextLength
-            ? splitForLimit(text, config.maxTextLength)
-            : [text];
-        let firstId: string | undefined;
-        for (let i = 0; i < chunks.length; i++) {
-          const chunk = chunks[i];
-          const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const result = await adapter.postMessage(
-            tid,
-            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
-          );
-          if (i === 0) firstId = result?.id;
-        }
-        return firstId;
-      } else if (message.files && message.files.length > 0) {
-        // Files only, no text
-        const fileUploads = message.files.map((f: { data: Buffer; filename: string }) => ({
-          data: f.data,
-          filename: f.filename,
-        }));
-        const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
-        return result?.id;
-      }
+      }); // PATCH08_CLOSE_DELIVER — end enqueueOutbound wrapper
     },
 
     async setTyping(platformId: string, threadId: string | null) {

@@ -1,0 +1,117 @@
+diff --git a/src/channels/chat-sdk-bridge.ts b/src/channels/chat-sdk-bridge.ts
+index 2250480..f254f15 100644
+--- a/src/channels/chat-sdk-bridge.ts
++++ b/src/channels/chat-sdk-bridge.ts
+@@ -74,6 +74,15 @@ export interface ChatSdkBridgeConfig {
+    * and reactions still target the head of the reply.
+    */
+   maxTextLength?: number;
++  /**
++   * Maximum caption length when sending text + files together. Telegram's
++   * `sendDocument.caption` field is capped at 1024 chars by the upstream
++   * Telegram Bot API. Without this, captions longer than 1024 chars are
++   * silently truncated by Telegram itself — even when `maxTextLength` would
++   * otherwise split safely. The bridge uses this to size the first chunk
++   * (which rides as the caption) tighter than the rest.
++   */
++  maxCaptionLength?: number;
+ }
+ 
+ /**
+@@ -103,6 +112,28 @@ function resolveSelectedOption(
+   return candidate;
+ }
+ 
++/**
++ * Per-thread outbound queue. When the agent emits multiple `<message>`
++ * blocks in one response, the host fires separate `send_message` tool
++ * calls that can run in parallel; Telegram's per-chat send rate (~1 msg/sec
++ * sustained) then silently drops some sends. The queue serializes outbound
++ * deliveries per chat without blocking other chats, with a small pacing
++ * delay so consecutive sends fall under the rate cap.
++ */
++const outboundQueues = new Map<string, Promise<unknown>>();
++const OUTBOUND_PACING_MS = 200;
++
++function enqueueOutbound<T>(tid: string, fn: () => Promise<T>): Promise<T> {
++  const prev = outboundQueues.get(tid) ?? Promise.resolve();
++  const next = prev
++    .then(() => new Promise<void>((r) => setTimeout(r, OUTBOUND_PACING_MS)))
++    .then(fn);
++  // Swallow rejection in the chain so subsequent enqueues still proceed,
++  // but the returned promise still rejects for the caller.
++  outboundQueues.set(tid, next.catch(() => {}));
++  return next;
++}
++
+ export function splitForLimit(text: string, limit: number): string[] {
+   if (text.length <= limit) return [text];
+   const chunks: string[] = [];
+@@ -457,6 +488,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
+       // platformId is already in the adapter's encoded format (e.g. "telegram:6037840640",
+       // "discord:guildId:channelId") — use it directly as the thread ID
+       const tid = threadId ?? platformId;
++      // PATCH 08: serialize outbound per-thread to avoid Telegram's per-chat
++      // rate limit silently dropping bursts when the agent emits multiple
++      // messages in one response.
++      return enqueueOutbound(tid, async () => {
+       const content = message.content as Record<string, unknown>;
+ 
+       // ── Tool-visibility accumulator ──────────────────────────────────
+@@ -581,12 +616,30 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
+           data: f.data,
+           filename: f.filename,
+         }));
+-        // Split if over the adapter's max length. Files ride on the first
+-        // chunk so the head of the reply still carries them.
+-        const chunks =
+-          config.maxTextLength && text.length > config.maxTextLength
+-            ? splitForLimit(text, config.maxTextLength)
+-            : [text];
++        // PATCH 08: caption-aware chunking. When files are attached, the
++        // first chunk rides as a file caption (Telegram sendDocument.caption:
++        // 1024 char limit), which is tighter than the regular sendMessage.text
++        // limit (4096). Use maxCaptionLength for the first chunk when files
++        // are present, maxTextLength for the rest.
++        const hasFiles = !!fileUploads && fileUploads.length > 0;
++        const firstChunkLimit =
++          hasFiles && config.maxCaptionLength
++            ? config.maxCaptionLength
++            : config.maxTextLength;
++        const restChunkLimit = config.maxTextLength;
++        let chunks: string[];
++        if (firstChunkLimit && text.length > firstChunkLimit) {
++          const head = splitForLimit(text, firstChunkLimit)[0];
++          const tail = text.slice(head.length).replace(/^\s+/, '');
++          const tailChunks = tail
++            ? restChunkLimit && tail.length > restChunkLimit
++              ? splitForLimit(tail, restChunkLimit)
++              : [tail]
++            : [];
++          chunks = [head, ...tailChunks];
++        } else {
++          chunks = [text];
++        }
+         let firstId: string | undefined;
+         for (let i = 0; i < chunks.length; i++) {
+           const chunk = chunks[i];
+@@ -607,6 +660,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
+         const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
+         return result?.id;
+       }
++      }); // PATCH08_CLOSE_DELIVER — end enqueueOutbound wrapper
+     },
+ 
+     async setTyping(platformId: string, threadId: string | null) {
+diff --git a/src/channels/telegram.ts b/src/channels/telegram.ts
+index ef85bd4..3fee7e6 100644
+--- a/src/channels/telegram.ts
++++ b/src/channels/telegram.ts
+@@ -211,6 +211,7 @@ registerChannelAdapter('telegram', {
+       supportsThreads: false,
+       transformOutboundText: sanitizeTelegramLegacyMarkdown,
+       maxTextLength: 4000,
++      maxCaptionLength: 1000,  // PATCH 08: Telegram sendDocument.caption hard limit is 1024, leave 24-char safety buffer
+     });
+ 
+     const botUsernamePromise = fetchBotUsername(token);

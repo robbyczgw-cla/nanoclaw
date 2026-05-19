@@ -69,6 +69,15 @@ else
   echo "❌ 07-empty-todowrite-suppress MISSING"
   ALL_OK=false
 fi
+
+# Patch 08 — telegram caption chunking + per-chat outbound queue
+if grep -q 'maxCaptionLength: 1000' src/channels/telegram.ts 2>/dev/null    && grep -q 'enqueueOutbound' src/channels/chat-sdk-bridge.ts 2>/dev/null    && grep -q 'PATCH08_CLOSE_DELIVER' src/channels/chat-sdk-bridge.ts 2>/dev/null; then
+  echo "✅ 08-telegram-caption-and-burst applied"
+else
+  echo "❌ 08-telegram-caption-and-burst MISSING (or partial)"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

@@ -211,6 +211,7 @@ registerChannelAdapter('telegram', {
       supportsThreads: false,
       transformOutboundText: sanitizeTelegramLegacyMarkdown,
       maxTextLength: 4000,
+      maxCaptionLength: 1000, // PATCH 08: Telegram sendDocument.caption hard limit is 1024, leave 24-char safety buffer
     });
 
     const botUsernamePromise = fetchBotUsername(token);
