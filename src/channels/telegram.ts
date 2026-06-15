@@ -195,15 +195,85 @@ function createPairingInterceptor(
   };
 }
 
+/**
+ * PATCH 05 (local) — Resilient outbound Telegram send.
+ *
+ * Telegram silently DROPS messages when a formatted (Markdown) send is rejected
+ * — e.g. HTTP 400 "can't parse entities" on markdown the legacy-V1 sanitizer
+ * missed (stray underscore in a path, nested formatting, unbalanced backtick).
+ * The @chat-adapter/telegram adapter correctly THROWS a typed error, but the
+ * rejection propagates to an unlogged call site and the message vanishes with no
+ * trace (confirmed: zero send errors in the journal despite repeated drops).
+ *
+ * This wraps the adapter's postMessage so it is resilient:
+ *   1. 429 rate-limit            -> wait `retry_after` then retry once
+ *   2. any other failure w/ text -> retry once as PLAIN text (markdown stripped),
+ *                                   so the message ALWAYS arrives (worst case
+ *                                   unformatted) instead of disappearing
+ *   3. every failure is logged   -> a drop is never silent again
+ *
+ * This is the minimal/low-risk fix. The clean long-term fix is bumping
+ * @chat-adapter/telegram to >=4.30 (legacy "Markdown" -> escaped "MarkdownV2")
+ * and dropping sanitizeTelegramLegacyMarkdown; remove this wrapper then.
+ */
+function makeResilientTelegramSend<A extends { postMessage: (...args: any[]) => Promise<any> }>(adapter: A): A {
+  const origPost = adapter.postMessage.bind(adapter) as (tid: string, m: any) => Promise<any>;
+  const stripMarkdown = (s: string): string => s.replace(/[*_`[\]]/g, '');
+  const isRateLimit = (e: unknown): boolean => {
+    const any = e as { name?: string; message?: string };
+    return (
+      any?.name === 'AdapterRateLimitError' || /\b429\b|too many requests|rate.?limit/i.test(String(any?.message ?? ''))
+    );
+  };
+  const retryAfterMs = (e: unknown): number => {
+    const any = e as { retryAfter?: number; parameters?: { retry_after?: number } };
+    return Math.max(1, Number(any?.retryAfter ?? any?.parameters?.retry_after ?? 1)) * 1000;
+  };
+  const errText = (e: unknown): string => String((e as { message?: string })?.message ?? e);
+  adapter.postMessage = (async (tid: string, message: any): Promise<any> => {
+    try {
+      return await origPost(tid, message);
+    } catch (err: unknown) {
+      let last = err;
+      if (isRateLimit(err)) {
+        const waitMs = retryAfterMs(err) + 250;
+        log.warn('Telegram 429 — waiting then retrying once', { tid, waitMs });
+        await new Promise((r) => setTimeout(r, waitMs));
+        try {
+          return await origPost(tid, message);
+        } catch (e2: unknown) {
+          last = e2;
+        }
+      }
+      const msg = message as { markdown?: unknown };
+      const md = typeof msg?.markdown === 'string' ? msg.markdown : '';
+      if (md.length > 0) {
+        log.error('Telegram formatted send failed — retrying as plain text', { tid, err: errText(last) });
+        try {
+          return await origPost(tid, { ...(message as object), markdown: stripMarkdown(md) });
+        } catch (e3: unknown) {
+          log.error('Telegram plain-text fallback ALSO failed — message dropped', { tid, err: errText(e3) });
+          throw e3;
+        }
+      }
+      log.error('Telegram send failed (no text to downgrade) — message dropped', { tid, err: errText(last) });
+      throw last;
+    }
+  }) as A['postMessage'];
+  return adapter;
+}
+
 registerChannelAdapter('telegram', {
   factory: () => {
     const env = readEnvFile(['TELEGRAM_BOT_TOKEN']);
     if (!env.TELEGRAM_BOT_TOKEN) return null;
     const token = env.TELEGRAM_BOT_TOKEN;
-    const telegramAdapter = createTelegramAdapter({
-      botToken: token,
-      mode: 'polling',
-    });
+    const telegramAdapter = makeResilientTelegramSend(
+      createTelegramAdapter({
+        botToken: token,
+        mode: 'polling',
+      }),
+    );
     const bridge = createChatSdkBridge({
       adapter: telegramAdapter,
       concurrency: 'concurrent',
