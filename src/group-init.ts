@@ -111,8 +111,11 @@ export function initGroupFilesystem(
   initialized.push('container_configs');
 
   // 2. data/v2-sessions/<id>/.claude-shared/ — Claude state + per-group skills
+  // claudeDir is function-scoped (not just inside the defaultSurfaces block)
+  // because the root-chown below references it (local session-chown patch;
+  // upstream 2.1.16 moved the declaration into the block).
+  const claudeDir = path.join(DATA_DIR, 'v2-sessions', group.id, '.claude-shared');
   if (defaultSurfaces) {
-    const claudeDir = path.join(DATA_DIR, 'v2-sessions', group.id, '.claude-shared');
     if (!fs.existsSync(claudeDir)) {
       fs.mkdirSync(claudeDir, { recursive: true });
       initialized.push('.claude-shared');
