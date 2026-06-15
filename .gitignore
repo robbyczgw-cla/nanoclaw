@@ -39,6 +39,13 @@ groups/*
 .nanoclaw/
 
 agents-sdk-docs
-
 # Runtime artefact (host creates this on first start; not source-of-truth)
 state.db
+
+.agents
+AGENTS.md
+
+# Internal working docs, never committed
+docs/maintainer-guide.md
+docs/drafts/
+forks.md
