@@ -20,6 +20,7 @@ This directory tracks every local source-code modification applied to `/root/nan
 | 08 | `src/channels/chat-sdk-bridge.ts` + `src/channels/telegram.ts` | Telegram caption chunking + per-chat outbound queue | none (local-only) | 🟢 local-only |
 | 09 | `src/channels/chat-sdk-bridge.ts` | Tool-vis edit coalescing (debounce bubble edits + finalize flush) | none (local-only) | 🟢 local-only |
 | 10 | `container/agent-runner/src/hooks/tool-visibility.ts` | Tool-vis task-session fix (classify on current batch, not global-latest row) | none (local-only) | 🟢 local-only |
+| 11 | `container/agent-runner/src/providers/{claude,turn-text}.ts` + `poll-loop.ts` | `<message>` block enqueue fix (dispatch full turn text, not just result.result) | none (local-only) | 🟢 local-only |
 
 **Apply order matters:** 02 must be applied before 03 — 03's apply-script anchors on strings introduced by 02. Patch 01 is independent of 02/03.
 
@@ -115,6 +116,7 @@ If any return 0, the patch was wiped — re-apply via the workflow above.
 
 ## History (newest first)
 
+- **2026-06-16** — Patch 11 applied (`<message>` block enqueue fix: accumulate full main-agent turn text and dispatch from it instead of only the SDK `result.result` final text, so a `<message>` block emitted before a trailing tool_use on long tool chains no longer vanishes silently; + loud-fail guard for malformed blocks)
 - **2026-06-16** — Patch 10 applied (tool-vis task-session fix: classify suppression on the current turn's `processing_ack` batch, not the global-latest inbound row, so a cron task landing mid-chat-turn no longer silences tool-vis for the reply)
 - **2026-06-16** — Patch 09 applied (tool-vis edit coalescing: debounce rolling-bubble edits to ≤1 per 2.5s + finalize-flush so the real reply posts fresh; cuts ~hundreds of tv-edits/turn to a handful, stops burying replies + tripping Telegram flood-control)
 - **2026-05-10 22:25** — Patch 06 applied (tool-vis v1.1: bash-prefix + task-suppress + cache-fix bundle, accumulated 2026-05-03 → 2026-05-07)

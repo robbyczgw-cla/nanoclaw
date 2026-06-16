@@ -14,6 +14,7 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
+import { countMessageOpenTags } from './providers/turn-text.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -565,15 +566,17 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * The agent must always wrap output in <message to="name">...</message>
  * blocks, even with a single destination. Bare text is scratchpad only.
  */
-function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
+export function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
   let sent = 0;
+  let matched = 0;
   let lastIndex = 0;
   const scratchpadParts: string[] = [];
 
   while ((match = MESSAGE_RE.exec(text)) !== null) {
+    matched++;
     if (match.index > lastIndex) {
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
@@ -598,6 +601,19 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
 
   if (scratchpad) {
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
+  }
+
+  // PATCH 11 loud-fail guard: if the output contains more `<message ...>`-shaped
+  // opening tags than the regex matched as complete blocks, a block is malformed
+  // (e.g. unclosed) and was NOT enqueued. Surface it instead of letting it
+  // vanish silently.
+  const openTags = countMessageOpenTags(text);
+  if (openTags > matched) {
+    log(
+      `WARNING: ${openTags} <message …> opening tag(s) but only ${matched} complete block(s) parsed — ` +
+        `${openTags - matched} message-shaped block(s) were NOT enqueued (malformed/unclosed). ` +
+        `Head: ${text.slice(0, 200).replace(/\n/g, ' ')}`,
+    );
   }
 
   const hasUnwrapped = sent === 0 && !!scratchpad;

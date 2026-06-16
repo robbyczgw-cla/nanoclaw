@@ -97,6 +97,16 @@ else
   ALL_OK=false
 fi
 
+# Patch 11 — <message> block enqueue fix (dispatch full turn text)
+if grep -q 'resolveTurnDispatchText' container/agent-runner/src/providers/claude.ts 2>/dev/null \
+   && grep -q 'extractMainAgentText' container/agent-runner/src/providers/turn-text.ts 2>/dev/null \
+   && grep -q 'countMessageOpenTags' container/agent-runner/src/poll-loop.ts 2>/dev/null; then
+  echo "✅ 11-message-block-enqueue-fix applied"
+else
+  echo "❌ 11-message-block-enqueue-fix MISSING (or partial — check claude.ts + turn-text.ts + poll-loop.ts)"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

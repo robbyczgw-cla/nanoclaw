@@ -7,6 +7,12 @@ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { postToolUseVisibility, preToolUseVisibility } from '../hooks/tool-visibility.js';
 import { registerProvider } from './provider-registry.js';
+import {
+  appendTurnText,
+  extractMainAgentText,
+  resolveTurnDispatchText,
+  type AssistantLikeMessage,
+} from './turn-text.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
 function log(msg: string): void {
@@ -437,6 +443,11 @@ export class ClaudeProvider implements AgentProvider {
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
+      // PATCH 11: accumulate every MAIN-agent assistant text block across the
+      // turn. result.result is only the FINAL text — a <message> block emitted
+      // before a trailing tool_use (common on long tool chains) would otherwise
+      // be dropped. Reset on each result (turn boundary / follow-up push).
+      let turnText = '';
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
@@ -446,8 +457,16 @@ export class ClaudeProvider implements AgentProvider {
 
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
+        } else if (message.type === 'assistant') {
+          // PATCH 11: capture main-agent text as it streams (sub-agent/Task
+          // messages carry parent_tool_use_id and are excluded).
+          turnText = appendTurnText(turnText, extractMainAgentText(message as AssistantLikeMessage));
         } else if (message.type === 'result') {
-          const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
+          const resultText = 'result' in message ? (message as { result?: string }).result ?? null : null;
+          // PATCH 11: dispatch from the full accumulated turn text (a superset of
+          // result.result), falling back to result.result if nothing was captured.
+          const text = resolveTurnDispatchText(turnText, resultText);
+          turnText = '';
           yield { type: 'result', text };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
