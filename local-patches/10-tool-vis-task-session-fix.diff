@@ -1,0 +1,54 @@
+diff --git a/container/agent-runner/src/hooks/tool-visibility.ts b/container/agent-runner/src/hooks/tool-visibility.ts
+index 5d28c65..d7dabeb 100644
+--- a/container/agent-runner/src/hooks/tool-visibility.ts
++++ b/container/agent-runner/src/hooks/tool-visibility.ts
+@@ -34,21 +34,40 @@ import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
+ 
+ import { writeMessageOut } from '../db/messages-out.js';
+ import { getSessionRouting } from '../db/session-routing.js';
+-import { getInboundDb } from '../db/connection.js';
++import { getInboundDb, getOutboundDb } from '../db/connection.js';
+ 
+ // Detect whether this agent turn was triggered by a scheduled-task wake-up
+ // (vs. an interactive chat message). Scheduled tasks often run with explicit
+ // silent-on-OK behavior — leaking tool-call previews to chat creates orphan-
+-// notification noise without context. We re-query on every call (no cache):
+-// the per-process cache pattern was buggy — first invocation locked the value
+-// for the container lifetime, so any task-cron firing later than the first
+-// chat-message would be misclassified as a non-task session.
++// notification noise without context.
++//
++// PATCH 10: classify on THIS turn's batch, not the global-latest inbound row.
++// The old `ORDER BY seq DESC LIMIT 1` flipped an in-progress *chat* turn to
++// silent whenever a cron task happened to land in inbound mid-turn (the ~10-min
++// monitoring cron firing during a chat reply) — suppressing all tool-vis for
++// that reply. The current turn's messages are recorded in outbound.db's
++// `processing_ack` (status='processing') by markProcessing(); a freshly-inserted
++// cron task is still 'pending' (next poll) and is NOT in this batch. We suppress
++// only when the in-flight batch is non-empty and contains NO interactive chat
++// message — i.e. a genuine task-only wake. Re-queried every call (no cache).
+ function isTaskSession(): boolean {
+   try {
+-    const db = getInboundDb();
+-    const row = db.prepare("SELECT kind FROM messages_in ORDER BY seq DESC LIMIT 1").get() as { kind?: string } | undefined;
+-    return row?.kind === 'task';
+-  } catch { return false; }
++    const acks = getOutboundDb()
++      .prepare("SELECT message_id FROM processing_ack WHERE status = 'processing'")
++      .all() as Array<{ message_id: string }>;
++    if (acks.length === 0) return false; // nothing in-flight → treat as interactive
++    const ids = acks.map((a) => a.message_id);
++    const placeholders = ids.map(() => '?').join(',');
++    const rows = getInboundDb()
++      .prepare(`SELECT kind FROM messages_in WHERE id IN (${placeholders})`)
++      .all(...ids) as Array<{ kind?: string }>;
++    if (rows.length === 0) return false;
++    // Any non-task (chat) message in the batch → interactive turn → show tool-vis.
++    const hasChat = rows.some((r) => r.kind && r.kind !== 'task');
++    return !hasChat;
++  } catch {
++    return false;
++  }
+ }
+ 
+ const SKIP_TOOLS = new Set(['WebSearch', 'Glob', 'Grep']);

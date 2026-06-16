@@ -78,6 +78,25 @@ else
   ALL_OK=false
 fi
 
+# Patch 09 — tool-vis edit coalescing (debounced bubble edits + finalize flush)
+if grep -q 'TOOL_VIS_EDIT_THROTTLE_MS' src/channels/chat-sdk-bridge.ts 2>/dev/null \
+   && grep -q 'function finalizeToolVis' src/channels/chat-sdk-bridge.ts 2>/dev/null \
+   && grep -q 'function flushToolVis' src/channels/chat-sdk-bridge.ts 2>/dev/null; then
+  echo "✅ 09-tool-vis-edit-coalescing applied"
+else
+  echo "❌ 09-tool-vis-edit-coalescing MISSING (or partial — check throttle const + flush/finalize)"
+  ALL_OK=false
+fi
+
+# Patch 10 — tool-vis task-session fix (classify on current processing batch)
+if grep -q "processing_ack WHERE status = 'processing'" container/agent-runner/src/hooks/tool-visibility.ts 2>/dev/null \
+   && grep -q 'PATCH 10' container/agent-runner/src/hooks/tool-visibility.ts 2>/dev/null; then
+  echo "✅ 10-tool-vis-task-session-fix applied"
+else
+  echo "❌ 10-tool-vis-task-session-fix MISSING"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

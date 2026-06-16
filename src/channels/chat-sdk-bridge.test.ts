@@ -350,3 +350,96 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     expect(msg.markdown).toBe('plain hello');
   });
 });
+
+describe('createChatSdkBridge.deliver — tool-vis edit coalescing (PATCH 09)', () => {
+  // A tool-heavy turn emits many `_toolVis: true` previews. Without coalescing
+  // each becomes its own Telegram editMessageText call, flooding the chat and
+  // tripping flood-control. These pin: (1) the first preview posts a fresh
+  // bubble, (2) rapid follow-ups within the throttle window do NOT each hit the
+  // API — they coalesce into a single trailing flush, (3) the real answer
+  // posts as a fresh notifying message, not an edit of the bubble.
+  function captureBoth() {
+    const post: Array<{ tid: string; m: { markdown?: string } }> = [];
+    const edit: Array<{ tid: string; mid: string; m: { markdown?: string } }> = [];
+    const postMessage = async (tid: string, m: AdapterPostableMessage): Promise<RawMessage<unknown>> => {
+      post.push({ tid, m: m as { markdown?: string } });
+      return { id: `m${post.length}`, threadId: tid, raw: {} };
+    };
+    const editMessage = async (tid: string, mid: string, m: AdapterPostableMessage): Promise<RawMessage<unknown>> => {
+      edit.push({ tid, mid, m: m as { markdown?: string } });
+      return { id: mid, threadId: tid, raw: {} };
+    };
+    return { post, edit, postMessage, editMessage };
+  }
+
+  it('coalesces a burst of previews into one edit and posts the answer fresh', async () => {
+    vi.useFakeTimers();
+    try {
+      const { post, edit, postMessage, editMessage } = captureBoth();
+      const bridge = createChatSdkBridge({
+        adapter: stubAdapter({ postMessage, editMessage }),
+        supportsThreads: false,
+        maxTextLength: 4000,
+      });
+      const tid = 'telegram:99';
+      const send = async (content: Record<string, unknown>) => {
+        const p = bridge.deliver(tid, null, { kind: 'chat-sdk', content });
+        await vi.advanceTimersByTimeAsync(250); // drain the 200ms enqueue pacing
+        return p;
+      };
+
+      // First preview → fresh bubble. Five more within the throttle window.
+      await send({ text: '🔧 step 1', _toolVis: true });
+      for (let i = 2; i <= 6; i++) await send({ text: `🔧 step ${i}`, _toolVis: true });
+
+      // One fresh bubble; the follow-ups are coalesced (not yet flushed).
+      expect(post).toHaveLength(1);
+      expect(edit).toHaveLength(0);
+
+      // Trailing flush fires once after the throttle window, with combined text.
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(edit).toHaveLength(1);
+      expect(edit[0].m.markdown).toContain('step 1');
+      expect(edit[0].m.markdown).toContain('step 6');
+
+      // The real answer arrives → a NEW notifying message, never an edit.
+      await send({ text: 'here is the final answer' });
+      expect(post).toHaveLength(2);
+      expect(post[1].m.markdown).toContain('final answer');
+      expect(edit).toHaveLength(1); // bubble was already clean; no extra edit
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flushes the bubble on finalize when the answer interrupts the throttle window', async () => {
+    vi.useFakeTimers();
+    try {
+      const { post, edit, postMessage, editMessage } = captureBoth();
+      const bridge = createChatSdkBridge({
+        adapter: stubAdapter({ postMessage, editMessage }),
+        supportsThreads: false,
+        maxTextLength: 4000,
+      });
+      const tid = 'telegram:77';
+      const send = async (content: Record<string, unknown>) => {
+        const p = bridge.deliver(tid, null, { kind: 'chat-sdk', content });
+        await vi.advanceTimersByTimeAsync(250);
+        return p;
+      };
+
+      await send({ text: 'step A', _toolVis: true }); // fresh bubble
+      await send({ text: 'step B', _toolVis: true }); // coalesced, timer pending
+
+      // Answer arrives before the trailing timer fires: finalize must flush the
+      // pending state (so the bubble shows step B) THEN post the answer fresh.
+      await send({ text: 'the answer' });
+      expect(edit).toHaveLength(1); // pending flush forced by finalize
+      expect(edit[0].m.markdown).toContain('step B');
+      expect(post).toHaveLength(2); // bubble + fresh answer
+      expect(post[1].m.markdown).toContain('the answer');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -132,6 +132,17 @@ function resolveSelectedOption(
 const outboundQueues = new Map<string, Promise<unknown>>();
 const OUTBOUND_PACING_MS = 200;
 
+// PATCH 09: tool-visibility edit coalescing. A tool-heavy turn emits dozens of
+// `tv-*` previews; without throttling each becomes its own Telegram
+// editMessageText call, flooding the chat (measured 211 tv-edits vs 72 real
+// messages in 30 min) and tripping Telegram flood-control — which buries the
+// real reply. We coalesce: rapid previews update the bubble text in memory and
+// flush to Telegram at most once per window (leading edit + trailing flush),
+// cutting dozens of API calls to a handful. The bubble is force-flushed when
+// the real answer arrives so it shows its final state before the fresh,
+// notifying reply posts below it.
+const TOOL_VIS_EDIT_THROTTLE_MS = 2500;
+
 function enqueueOutbound<T>(tid: string, fn: () => Promise<T>): Promise<T> {
   const prev = outboundQueues.get(tid) ?? Promise.resolve();
   const next = prev.then(() => new Promise<void>((r) => setTimeout(r, OUTBOUND_PACING_MS))).then(fn);
@@ -164,6 +175,10 @@ interface ToolVisAccumulator {
   messageId: string;
   lines: string[];
   combinedLength: number;
+  // PATCH 09 edit-coalescing state:
+  lastEditAt: number; // timestamp of the last editMessage actually sent
+  pendingTimer: ReturnType<typeof setTimeout> | null; // trailing-flush timer
+  dirty: boolean; // in-memory lines changed since the last flush
 }
 
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
@@ -174,10 +189,46 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   // actual answer flushes the accumulator).
   const toolVisAccumulators = new Map<string, ToolVisAccumulator>();
 
+  // PATCH 09: Push the accumulator's current in-memory text to Telegram as a
+  // single editMessage. The actual coalescing happens in
+  // deliverToolVisAccumulator (which decides whether to flush now or defer);
+  // this just performs the edit and clears the dirty flag. Falls back to a
+  // fresh send if the edit fails (message gone, etc.). No-op when the
+  // accumulator is missing (already finalized) or not dirty (nothing new).
+  // The caller is responsible for serialization (it runs inside enqueueOutbound
+  // for inline flushes; the trailing-flush timer wraps it in enqueueOutbound).
+  async function flushToolVis(tid: string, accumKey: string): Promise<void> {
+    const acc = toolVisAccumulators.get(accumKey);
+    if (!acc || !acc.dirty) return;
+    const combined = transformText(acc.lines.join('\n'));
+    try {
+      await adapter.editMessage(tid, acc.messageId, { markdown: combined });
+      acc.dirty = false;
+      acc.lastEditAt = Date.now();
+    } catch (err) {
+      // Edit failed — rate-limit, message-deleted, adapter without edit
+      // support, or unchanged-content. Re-post the full combined text fresh so
+      // the visible bubble still carries everything accumulated so far.
+      log.warn('Tool-vis edit failed, falling back to fresh send', {
+        err: err instanceof Error ? err.message : String(err),
+        adapter: adapter.name,
+      });
+      const result = await adapter.postMessage(tid, { markdown: combined });
+      const id = result?.id;
+      if (id) {
+        acc.messageId = id;
+        acc.dirty = false;
+        acc.lastEditAt = Date.now();
+      }
+    }
+  }
+
   // Send a tool-visibility line into an accumulator. First line for a key
-  // creates a new message; subsequent lines edit that message in-place.
-  // Falls back to a fresh send if edit fails (rate limit, message gone,
-  // adapter doesn't support edit on this platform).
+  // creates a new message; subsequent lines update that message in-place —
+  // but COALESCED (PATCH 09): rapid previews only mutate the in-memory text and
+  // are flushed to Telegram at most once per TOOL_VIS_EDIT_THROTTLE_MS via a
+  // leading edit plus a trailing-flush timer, so dozens of tool calls cost a
+  // handful of API calls instead of dozens.
   async function deliverToolVisAccumulator(
     tid: string,
     lineText: string,
@@ -195,16 +246,24 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           messageId: id,
           lines: [lineText],
           combinedLength: lineText.length,
+          lastEditAt: Date.now(),
+          pendingTimer: null,
+          dirty: false,
         });
       }
       return id;
     }
 
     // Length guard — if the next line would push past the adapter's limit,
-    // close out the current accumulator and start a fresh one rather than
-    // truncating mid-call. Cheaper than tracking edits across split chunks.
+    // flush the current bubble's pending text, then start a fresh bubble rather
+    // than truncating mid-call.
     const projected = existing.combinedLength + 1 + lineText.length;
     if (config.maxTextLength && projected > config.maxTextLength) {
+      if (existing.pendingTimer) {
+        clearTimeout(existing.pendingTimer);
+        existing.pendingTimer = null;
+      }
+      await flushToolVis(tid, accumKey);
       const result = await adapter.postMessage(tid, { markdown: transformed });
       const id = result?.id;
       if (id) {
@@ -212,41 +271,55 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           messageId: id,
           lines: [lineText],
           combinedLength: lineText.length,
+          lastEditAt: Date.now(),
+          pendingTimer: null,
+          dirty: false,
         });
       }
       return id;
     }
 
-    // Edit the existing message with the combined text.
-    const combinedRaw = existing.lines.concat(lineText).join('\n');
-    try {
-      await adapter.editMessage(tid, existing.messageId, {
-        markdown: transformText(combinedRaw),
-      });
-      existing.lines.push(lineText);
-      existing.combinedLength = combinedRaw.length;
-      return existing.messageId;
-    } catch (err) {
-      // Edit failed — could be rate-limit, message-deleted, adapter without
-      // edit support, or unchanged-content. Fall back to a fresh send and
-      // restart the accumulator at this line.
-      log.warn('Tool-vis edit failed, falling back to fresh send', {
-        err: err instanceof Error ? err.message : String(err),
-        adapter: adapter.name,
-      });
-      const result = await adapter.postMessage(tid, { markdown: transformed });
-      const id = result?.id;
-      if (id) {
-        toolVisAccumulators.set(accumKey, {
-          messageId: id,
-          lines: [lineText],
-          combinedLength: lineText.length,
-        });
-      } else {
-        toolVisAccumulators.delete(accumKey);
+    // Accumulate the line in memory and mark dirty.
+    existing.lines.push(lineText);
+    existing.combinedLength = existing.lines.join('\n').length;
+    existing.dirty = true;
+
+    const sinceLast = Date.now() - existing.lastEditAt;
+    if (sinceLast >= TOOL_VIS_EDIT_THROTTLE_MS) {
+      // Enough time has passed — flush now (leading edge). Cancel any pending
+      // trailing timer; this flush subsumes it.
+      if (existing.pendingTimer) {
+        clearTimeout(existing.pendingTimer);
+        existing.pendingTimer = null;
       }
-      return id;
+      await flushToolVis(tid, accumKey);
+    } else if (!existing.pendingTimer) {
+      // Within the throttle window — schedule a single trailing flush that
+      // ships whatever has accumulated by the time it fires. Wrapped in
+      // enqueueOutbound so it serializes with other sends to this thread.
+      const delay = TOOL_VIS_EDIT_THROTTLE_MS - sinceLast;
+      existing.pendingTimer = setTimeout(() => {
+        const acc = toolVisAccumulators.get(accumKey);
+        if (acc) acc.pendingTimer = null;
+        void enqueueOutbound(tid, () => flushToolVis(tid, accumKey)).catch(() => {});
+      }, delay);
     }
+    // else: a trailing flush is already scheduled; this line rides along.
+    return existing.messageId;
+  }
+
+  // PATCH 09: finalize an open tool-vis bubble — cancel its pending trailing
+  // flush and push its final state synchronously, so the bubble is complete
+  // before the real answer posts as a fresh, notifying message below it.
+  async function finalizeToolVis(tid: string, accumKey: string): Promise<void> {
+    const acc = toolVisAccumulators.get(accumKey);
+    if (!acc) return;
+    if (acc.pendingTimer) {
+      clearTimeout(acc.pendingTimer);
+      acc.pendingTimer = null;
+    }
+    await flushToolVis(tid, accumKey);
+    toolVisAccumulators.delete(accumKey);
   }
 
   const { adapter } = config;
@@ -541,9 +614,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           if (!lineText) return;
           return await deliverToolVisAccumulator(tid, lineText, accumKey);
         }
-        // Non-tool-vis message → close any open accumulator for this thread
-        // so the agent's actual answer renders as a separate bubble.
-        toolVisAccumulators.delete(accumKey);
+        // Non-tool-vis message → finalize any open tool-vis bubble (flush its
+        // pending coalesced state, PATCH 09) so the agent's actual answer
+        // renders as a separate, fresh, notifying bubble below the completed
+        // tool-vis timeline.
+        await finalizeToolVis(tid, accumKey);
 
         if (content.operation === 'edit' && content.messageId) {
           await adapter.editMessage(tid, content.messageId as string, {
@@ -703,6 +778,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     async teardown() {
       gatewayAbort?.abort();
+      // PATCH 09: cancel any in-flight tool-vis trailing-flush timers so they
+      // can't fire an edit after the Chat instance is torn down.
+      for (const acc of toolVisAccumulators.values()) {
+        if (acc.pendingTimer) clearTimeout(acc.pendingTimer);
+      }
+      toolVisAccumulators.clear();
       await chat.shutdown();
       log.info('Chat SDK bridge shut down', { adapter: adapter.name });
     },
