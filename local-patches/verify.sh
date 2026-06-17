@@ -98,12 +98,24 @@ else
 fi
 
 # Patch 11 — <message> block enqueue fix (dispatch full turn text)
+# (poll-loop's guard symbol was superseded by patch 12's countMessageBlockOpenTags;
+#  anchor on the stable turn-text-accumulation symbols instead.)
 if grep -q 'resolveTurnDispatchText' container/agent-runner/src/providers/claude.ts 2>/dev/null \
    && grep -q 'extractMainAgentText' container/agent-runner/src/providers/turn-text.ts 2>/dev/null \
-   && grep -q 'countMessageOpenTags' container/agent-runner/src/poll-loop.ts 2>/dev/null; then
+   && grep -q 'appendTurnText' container/agent-runner/src/providers/claude.ts 2>/dev/null; then
   echo "✅ 11-message-block-enqueue-fix applied"
 else
   echo "❌ 11-message-block-enqueue-fix MISSING (or partial — check claude.ts + turn-text.ts + poll-loop.ts)"
+  ALL_OK=false
+fi
+
+# Patch 12 — turn-stall fix (tolerant parse + capped in-turn re-prompt)
+if grep -q 'parseMessageBlocks' container/agent-runner/src/message-blocks.ts 2>/dev/null \
+   && grep -q 'message|parameter|invoke' container/agent-runner/src/message-blocks.ts 2>/dev/null \
+   && grep -q 'MAX_UNWRAPPED_RETRIES' container/agent-runner/src/poll-loop.ts 2>/dev/null; then
+  echo "✅ 12-turn-stall-rejected-response applied"
+else
+  echo "❌ 12-turn-stall-rejected-response MISSING (or partial — check message-blocks.ts + poll-loop.ts)"
   ALL_OK=false
 fi
 

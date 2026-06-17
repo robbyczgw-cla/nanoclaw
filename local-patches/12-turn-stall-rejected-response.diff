@@ -1,0 +1,237 @@
+diff --git a/container/agent-runner/src/message-blocks.ts b/container/agent-runner/src/message-blocks.ts
+new file mode 100644
+index 0000000..957265a
+--- /dev/null
++++ b/container/agent-runner/src/message-blocks.ts
+@@ -0,0 +1,59 @@
++/**
++ * Parsing of the agent's `<message to="name">…</message>` output blocks
++ * (PATCH 12). Pure + dependency-free so the tolerant-parsing and reminder
++ * behaviour is unit-testable without the SDK / DB.
++ *
++ * BUG: when the model accidentally closed a `<message>` block with
++ * `</parameter>` or `</invoke>` (tool-call syntax bleed) instead of
++ * `</message>`, the strict parser matched nothing → the whole response was
++ * discarded → "not delivered, re-send" reminder → the turn went idle and only
++ * resumed on the next inbound event (cron / user msg) = minutes-long stalls.
++ *
++ * FIX: tolerant closing tag — accept `</message>`, `</parameter>` and
++ * `</invoke>` as the block terminator. A single tag typo must not kill an
++ * otherwise valid message.
++ */
++
++export interface ParsedBlock {
++  to: string;
++  body: string;
++  start: number; // index of the opening `<message` in the source text
++  end: number; // index just past the closing tag
++}
++
++// Tolerant closing tag: </message> | </parameter> | </invoke>.
++const BLOCK_SOURCE = '<message\\s+to="([^"]+)"\\s*>([\\s\\S]*?)<\\/(?:message|parameter|invoke)>';
++
++export function parseMessageBlocks(text: string): ParsedBlock[] {
++  const re = new RegExp(BLOCK_SOURCE, 'g');
++  const blocks: ParsedBlock[] = [];
++  let m: RegExpExecArray | null;
++  while ((m = re.exec(text)) !== null) {
++    blocks.push({ to: m[1], body: m[2].trim(), start: m.index, end: re.lastIndex });
++  }
++  return blocks;
++}
++
++/** Count `<message …>` opening tags — for the malformed-block guard. */
++export function countMessageBlockOpenTags(text: string): number {
++  return (text.match(/<message\b[^>]*>/g) ?? []).length;
++}
++
++/**
++ * Build the in-turn re-prompt reminder for a discarded response, naming the
++ * ACTUAL problem (so the model can self-correct instead of repeating it) and
++ * listing the valid destination names.
++ */
++export function buildRewrapReminder(unknownDestinations: string[], destinationNames: string[]): string {
++  const names = destinationNames.join(', ');
++  const reason = unknownDestinations.length
++    ? `The destination name${unknownDestinations.length > 1 ? 's' : ''} ${unknownDestinations
++        .map((n) => `"${n}"`)
++        .join(', ')} ${unknownDestinations.length > 1 ? 'are' : 'is'} not valid.`
++    : `Your response had no usable <message to="name">…</message> block (it may have been unwrapped, or a block was closed with the wrong tag such as </parameter> instead of </message>).`;
++  return (
++    `<system>Your last response was NOT delivered. ${reason} ` +
++    `Wrap any content you want to send in <message to="name">…</message>, using EXACTLY one of these destination names: ${names}. ` +
++    `Use <internal>…</internal> for scratchpad. Re-send your response now with the correct wrapping.</system>`
++  );
++}
+diff --git a/container/agent-runner/src/poll-loop.ts b/container/agent-runner/src/poll-loop.ts
+index 13006a7..31eaa39 100644
+--- a/container/agent-runner/src/poll-loop.ts
++++ b/container/agent-runner/src/poll-loop.ts
+@@ -14,11 +14,14 @@ import {
+   type RoutingContext,
+ } from './formatter.js';
+ import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
+-import { countMessageOpenTags } from './providers/turn-text.js';
++import { buildRewrapReminder, countMessageBlockOpenTags, parseMessageBlocks } from './message-blocks.js';
+ import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+ 
+ const POLL_INTERVAL_MS = 1000;
+ const ACTIVE_POLL_INTERVAL_MS = 500;
++// PATCH 12: max in-turn re-prompts when a final response is discarded
++// (unwrapped / malformed / unknown-destination) before giving up loudly.
++const MAX_UNWRAPPED_RETRIES = 2;
+ 
+ /**
+  * Number of consecutive `database disk image is malformed` errors after which
+@@ -335,7 +338,7 @@ async function processQuery(
+ ): Promise<QueryResult> {
+   let queryContinuation: string | undefined;
+   let done = false;
+-  let unwrappedNudged = false;
++  let unwrappedRetries = 0;
+   // Prompt queue for the exchange hook — each result event consumes the
+   // oldest unanswered prompt, except a wrapping-retry result, which answers
+   // the same prompt again. Unused (and unmaintained) when the provider
+@@ -418,7 +421,7 @@ async function processQuery(
+         const keptIds = keep.map((m) => m.id);
+         const prompt = formatMessages(keep);
+         log(`Pushing ${keep.length} follow-up message(s) into active query`);
+-        unwrappedNudged = false;
++        unwrappedRetries = 0;
+         query.push(prompt);
+         archivePrompts.push(prompt);
+         markCompleted(keptIds);
+@@ -483,8 +486,10 @@ async function processQuery(
+         // at all — either way the turn is finished.
+         markCompleted(initialBatchIds);
+         if (event.text) {
+-          const { hasUnwrapped } = dispatchResultText(event.text, routing);
+-          const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
++          const { hasUnwrapped, unknownDestinations } = dispatchResultText(event.text, routing);
++          // PATCH 12: cap re-prompts with a COUNTER (was a single bool, so the
++          // turn gave up after one retry and idled until the next inbound).
++          const willRetryWrapping = hasUnwrapped && unwrappedRetries < MAX_UNWRAPPED_RETRIES;
+           notifyExchangeComplete(onExchangeComplete, {
+             prompt: archivePrompts[0] ?? initialPrompt,
+             result: event.text,
+@@ -492,14 +497,25 @@ async function processQuery(
+             status: hasUnwrapped ? 'undelivered' : 'completed',
+           });
+           if (willRetryWrapping) {
+-            unwrappedNudged = true;
+-            const destinations = getAllDestinations();
+-            const names = destinations.map((d) => d.name).join(', ');
+-            query.push(
+-              `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+-                `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+-                `Your destinations: ${names}. ` +
+-                `Please re-send your response with the correct wrapping.</system>`,
++            unwrappedRetries++;
++            // PATCH 12: re-prompt IN-TURN with SPECIFIC feedback (the real
++            // reason — unknown destination name, or malformed/wrong closing
++            // tag) so the model can self-correct instead of repeating it.
++            const names = getAllDestinations().map((d) => d.name);
++            log(
++              `Discarded response (re-prompt ${unwrappedRetries}/${MAX_UNWRAPPED_RETRIES}) — ` +
++                (unknownDestinations.length
++                  ? `unknown destination(s): ${unknownDestinations.join(', ')}; valid: ${names.join(', ')}`
++                  : `no deliverable <message> block`),
++            );
++            query.push(buildRewrapReminder(unknownDestinations, names));
++          } else if (hasUnwrapped) {
++            // PATCH 12: cap exhausted — give up LOUDLY rather than silently
++            // idling until the next inbound wakes the turn.
++            log(
++              `WARNING: response still not deliverable after ${unwrappedRetries} re-prompt(s) — giving up; ` +
++                `the user gets no reply for this turn` +
++                (unknownDestinations.length ? ` (unknown destination(s): ${unknownDestinations.join(', ')})` : ''),
+             );
+           }
+           // The wrapping-retry result answers the SAME user prompt — keep it
+@@ -566,31 +582,35 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
+  * The agent must always wrap output in <message to="name">...</message>
+  * blocks, even with a single destination. Bare text is scratchpad only.
+  */
+-export function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
+-  const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
++export function dispatchResultText(
++  text: string,
++  routing: RoutingContext,
++): { sent: number; hasUnwrapped: boolean; unknownDestinations: string[] } {
++  // PATCH 12: tolerant parsing — a <message> block closed with </parameter> or
++  // </invoke> (tool-call syntax bleed) instead of </message> is still accepted
++  // (see parseMessageBlocks) so a single tag typo no longer discards the whole
++  // response and stalls the turn.
++  const blocks = parseMessageBlocks(text);
+ 
+-  let match: RegExpExecArray | null;
+   let sent = 0;
+-  let matched = 0;
+   let lastIndex = 0;
+   const scratchpadParts: string[] = [];
++  const unknownDestinations: string[] = [];
+ 
+-  while ((match = MESSAGE_RE.exec(text)) !== null) {
+-    matched++;
+-    if (match.index > lastIndex) {
+-      scratchpadParts.push(text.slice(lastIndex, match.index));
++  for (const b of blocks) {
++    if (b.start > lastIndex) {
++      scratchpadParts.push(text.slice(lastIndex, b.start));
+     }
+-    const toName = match[1];
+-    const body = match[2].trim();
+-    lastIndex = MESSAGE_RE.lastIndex;
++    lastIndex = b.end;
+ 
+-    const dest = findByName(toName);
++    const dest = findByName(b.to);
+     if (!dest) {
+-      log(`Unknown destination in <message to="${toName}">, dropping block`);
+-      scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
++      log(`Unknown destination in <message to="${b.to}">, dropping block`);
++      unknownDestinations.push(b.to);
++      scratchpadParts.push(`[dropped: unknown destination "${b.to}"] ${b.body}`);
+       continue;
+     }
+-    sendToDestination(dest, body, routing);
++    sendToDestination(dest, b.body, routing);
+     sent++;
+   }
+   if (lastIndex < text.length) {
+@@ -603,24 +623,25 @@ export function dispatchResultText(text: string, routing: RoutingContext): { sen
+     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
+   }
+ 
+-  // PATCH 11 loud-fail guard: if the output contains more `<message ...>`-shaped
+-  // opening tags than the regex matched as complete blocks, a block is malformed
+-  // (e.g. unclosed) and was NOT enqueued. Surface it instead of letting it
+-  // vanish silently.
+-  const openTags = countMessageOpenTags(text);
+-  if (openTags > matched) {
++  // PATCH 11 loud-fail guard: more `<message …>` opening tags than complete
++  // blocks parsed ⇒ a block is malformed (e.g. unclosed) and was NOT enqueued.
++  const openTags = countMessageBlockOpenTags(text);
++  if (openTags > blocks.length) {
+     log(
+-      `WARNING: ${openTags} <message …> opening tag(s) but only ${matched} complete block(s) parsed — ` +
+-        `${openTags - matched} message-shaped block(s) were NOT enqueued (malformed/unclosed). ` +
++      `WARNING: ${openTags} <message …> opening tag(s) but only ${blocks.length} complete block(s) parsed — ` +
++        `${openTags - blocks.length} message-shaped block(s) were NOT enqueued (malformed/unclosed). ` +
+         `Head: ${text.slice(0, 200).replace(/\n/g, ' ')}`,
+     );
+   }
+ 
+   const hasUnwrapped = sent === 0 && !!scratchpad;
+   if (hasUnwrapped) {
+-    log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
++    log(
++      `WARNING: agent output had no deliverable <message to="..."> blocks — nothing was sent` +
++        (unknownDestinations.length ? ` (unknown destination(s): ${unknownDestinations.join(', ')})` : ''),
++    );
+   }
+-  return { sent, hasUnwrapped };
++  return { sent, hasUnwrapped, unknownDestinations };
+ }
+ 
+ function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
