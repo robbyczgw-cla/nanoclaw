@@ -110,12 +110,21 @@ else
 fi
 
 # Patch 12 — turn-stall fix (tolerant parse + capped in-turn re-prompt)
+# (anchor on stable symbols; patch 13 rewrote the closing-tag regex.)
 if grep -q 'parseMessageBlocks' container/agent-runner/src/message-blocks.ts 2>/dev/null \
-   && grep -q 'message|parameter|invoke' container/agent-runner/src/message-blocks.ts 2>/dev/null \
+   && grep -q 'buildRewrapReminder' container/agent-runner/src/message-blocks.ts 2>/dev/null \
    && grep -q 'MAX_UNWRAPPED_RETRIES' container/agent-runner/src/poll-loop.ts 2>/dev/null; then
   echo "✅ 12-turn-stall-rejected-response applied"
 else
   echo "❌ 12-turn-stall-rejected-response MISSING (or partial — check message-blocks.ts + poll-loop.ts)"
+  ALL_OK=false
+fi
+
+# Patch 13 — tolerant parse tail-strip (no mid-body cut)
+if grep -q 'TRAILING_STRAY_CLOSE' container/agent-runner/src/message-blocks.ts 2>/dev/null; then
+  echo "✅ 13-message-tag-tail-strip applied"
+else
+  echo "❌ 13-message-tag-tail-strip MISSING"
   ALL_OK=false
 fi
 

@@ -22,6 +22,7 @@ This directory tracks every local source-code modification applied to `/root/nan
 | 10 | `container/agent-runner/src/hooks/tool-visibility.ts` | Tool-vis task-session fix (classify on current batch, not global-latest row) | none (local-only) | 🟢 local-only |
 | 11 | `container/agent-runner/src/providers/{claude,turn-text}.ts` + `poll-loop.ts` | `<message>` block enqueue fix (dispatch full turn text, not just result.result) | none (local-only) | 🟢 local-only |
 | 12 | `container/agent-runner/src/{message-blocks,poll-loop}.ts` | Turn-stall fix (tolerant `</parameter>`/`</invoke>` parse + capped in-turn re-prompt + specific feedback) | none (local-only) | 🟢 local-only |
+| 13 | `container/agent-runner/src/message-blocks.ts` | Tolerant parse tail-strip (no mid-body cut on a quoted `</parameter>`/`</invoke>`) | none (local-only) | 🟢 local-only |
 
 **Apply order matters:** 02 must be applied before 03 — 03's apply-script anchors on strings introduced by 02. Patch 01 is independent of 02/03.
 
@@ -117,6 +118,7 @@ If any return 0, the patch was wiped — re-apply via the workflow above.
 
 ## History (newest first)
 
+- **2026-06-17** — Patch 13 applied (edge-case fix for patch 12: tolerant `<message>` parse now prefers `</message>` and only strips a TRAILING stray `</parameter>`/`</invoke>` — a quoted tag mid-body no longer truncates the message; ground truth was a confirmation that quoted the tag in backticks)
 - **2026-06-17** — Patch 12 applied (turn-stall on rejected response: tolerant `</parameter>`/`</invoke>` closing-tag parsing eliminates the reported trigger; re-prompt cap is now a counter (2) with SPECIFIC feedback naming the bad destination/tag, and gives up loudly instead of idling until the next inbound)
 - **2026-06-16** — Patch 11 applied (`<message>` block enqueue fix: accumulate full main-agent turn text and dispatch from it instead of only the SDK `result.result` final text, so a `<message>` block emitted before a trailing tool_use on long tool chains no longer vanishes silently; + loud-fail guard for malformed blocks)
 - **2026-06-16** — Patch 10 applied (tool-vis task-session fix: classify suppression on the current turn's `processing_ack` batch, not the global-latest inbound row, so a cron task landing mid-chat-turn no longer silences tool-vis for the reply)

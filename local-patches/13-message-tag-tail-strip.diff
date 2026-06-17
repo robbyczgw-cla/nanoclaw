@@ -1,0 +1,58 @@
+diff --git a/container/agent-runner/src/message-blocks.ts b/container/agent-runner/src/message-blocks.ts
+index 957265a..8435ac8 100644
+--- a/container/agent-runner/src/message-blocks.ts
++++ b/container/agent-runner/src/message-blocks.ts
+@@ -21,15 +21,47 @@ export interface ParsedBlock {
+   end: number; // index just past the closing tag
+ }
+ 
+-// Tolerant closing tag: </message> | </parameter> | </invoke>.
+-const BLOCK_SOURCE = '<message\\s+to="([^"]+)"\\s*>([\\s\\S]*?)<\\/(?:message|parameter|invoke)>';
++const OPEN_TAG = /<message\s+to="([^"]+)"\s*>/g;
++const CLOSE_MESSAGE = '</message>';
++// PATCH 13: only a </parameter> / </invoke> sitting at the TRUE END of the
++// (trimmed) block body counts as an accidental closer.
++const TRAILING_STRAY_CLOSE = /<\/(?:parameter|invoke)>$/;
+ 
+ export function parseMessageBlocks(text: string): ParsedBlock[] {
+-  const re = new RegExp(BLOCK_SOURCE, 'g');
+-  const blocks: ParsedBlock[] = [];
++  // Collect all opening tags first so each block's region is bounded by the
++  // next opening (a no-</message> block can't swallow the following block).
++  const opens: Array<{ to: string; start: number; bodyStart: number }> = [];
++  const openRe = new RegExp(OPEN_TAG.source, 'g');
+   let m: RegExpExecArray | null;
+-  while ((m = re.exec(text)) !== null) {
+-    blocks.push({ to: m[1], body: m[2].trim(), start: m.index, end: re.lastIndex });
++  while ((m = openRe.exec(text)) !== null) {
++    opens.push({ to: m[1], start: m.index, bodyStart: openRe.lastIndex });
++  }
++
++  const blocks: ParsedBlock[] = [];
++  for (let i = 0; i < opens.length; i++) {
++    const cur = opens[i];
++    const regionEnd = i + 1 < opens.length ? opens[i + 1].start : text.length;
++
++    // PATCH 13 — PRIMARY: prefer a real </message>. If one exists in this
++    // block's region, EVERYTHING before it is the body — including any
++    // </parameter>/</invoke> the model quoted in the text. Never cut at a
++    // body tag when a real closer is present.
++    const closeIdx = text.indexOf(CLOSE_MESSAGE, cur.bodyStart);
++    if (closeIdx !== -1 && closeIdx < regionEnd) {
++      blocks.push({
++        to: cur.to,
++        body: text.slice(cur.bodyStart, closeIdx).trim(),
++        start: cur.start,
++        end: closeIdx + CLOSE_MESSAGE.length,
++      });
++      continue;
++    }
++
++    // PATCH 13 — FALLBACK (no </message>): take the whole region as body and
++    // strip ONLY a stray </parameter>/</invoke> at the TRUE END. A mid-body
++    // occurrence (e.g. the tag name quoted in backticks) is kept.
++    const body = text.slice(cur.bodyStart, regionEnd).trim().replace(TRAILING_STRAY_CLOSE, '').trimEnd();
++    blocks.push({ to: cur.to, body, start: cur.start, end: regionEnd });
+   }
+   return blocks;
+ }

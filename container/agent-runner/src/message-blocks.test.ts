@@ -43,6 +43,41 @@ describe('parseMessageBlocks — tolerant closing tag (PATCH 12, turn-stall fix)
   });
 });
 
+describe('parseMessageBlocks — tail-strip, no mid-body cut (PATCH 13)', () => {
+  it('(a) REGRESSION: body QUOTES the tag in backticks AND ends with a stray </parameter> — full body kept, only trailing tag stripped', () => {
+    // The exact 2026-06-17 ground truth: a confirmation that mentioned the tag
+    // name in backticks and (accidentally) closed with the same tag.
+    const text = '<message to="Robby">✅ Bin wieder da — auf Patch-12-Code (tolerantes `</parameter>`/`</invoke>` Parsing) — fertig.</parameter>';
+    const blocks = parseMessageBlocks(text);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].body).toBe('✅ Bin wieder da — auf Patch-12-Code (tolerantes `</parameter>`/`</invoke>` Parsing) — fertig.');
+    // crucially: NOT cut at the first backtick-quoted </parameter>
+    expect(blocks[0].body).toContain('`</parameter>`');
+    expect(blocks[0].body).toContain('fertig.');
+  });
+
+  it('(b) body QUOTES the tag but closes correctly with </message> — quoted tag stays in the text', () => {
+    const text = '<message to="Robby">use `</parameter>` to close a tool param, ok?</message>';
+    const blocks = parseMessageBlocks(text);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].body).toBe('use `</parameter>` to close a tool param, ok?');
+  });
+
+  it('(c) normal </message> is unchanged', () => {
+    expect(parseMessageBlocks('<message to="A">plain answer</message>')[0].body).toBe('plain answer');
+  });
+
+  it('strips a trailing stray closer with trailing whitespace too', () => {
+    expect(parseMessageBlocks('<message to="A">hi</invoke>  ')[0].body).toBe('hi');
+  });
+
+  it('does NOT strip a </parameter> that is mid-body when there is no real closer', () => {
+    // tag quoted mid-body, block ends with plain text (no closer at all)
+    const [b] = parseMessageBlocks('<message to="A">the `</parameter>` token is XML</invoke>');
+    expect(b.body).toBe('the `</parameter>` token is XML');
+  });
+});
+
 describe('countMessageBlockOpenTags (PATCH 11 guard, retained)', () => {
   it('counts opening tags regardless of closing tag', () => {
     expect(countMessageBlockOpenTags('<message to="A">x</parameter>')).toBe(1);
