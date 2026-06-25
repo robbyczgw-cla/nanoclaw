@@ -434,7 +434,10 @@ describe('error result with no <message> envelope', () => {
 
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
-    expect(pushes[0]).toContain('was not delivered');
+    // PATCH 12 replaced the generic nudge with buildRewrapReminder ("...was
+    // NOT delivered. ..."), which is more specific. Match the concept
+    // case-insensitively rather than upstream's exact lowercase wording.
+    expect(pushes[0]).toMatch(/not delivered/i);
   });
 });
 
