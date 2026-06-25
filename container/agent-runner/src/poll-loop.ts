@@ -327,7 +327,7 @@ interface QueryResult {
   continuation?: string;
 }
 
-async function processQuery(
+export async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
@@ -486,41 +486,56 @@ async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { hasUnwrapped, unknownDestinations } = dispatchResultText(event.text, routing);
-          // PATCH 12: cap re-prompts with a COUNTER (was a single bool, so the
-          // turn gave up after one retry and idled until the next inbound).
-          const willRetryWrapping = hasUnwrapped && unwrappedRetries < MAX_UNWRAPPED_RETRIES;
-          notifyExchangeComplete(onExchangeComplete, {
-            prompt: archivePrompts[0] ?? initialPrompt,
-            result: event.text,
-            continuation: queryContinuation ?? initialContinuation,
-            status: hasUnwrapped ? 'undelivered' : 'completed',
-          });
-          if (willRetryWrapping) {
-            unwrappedRetries++;
-            // PATCH 12: re-prompt IN-TURN with SPECIFIC feedback (the real
-            // reason — unknown destination name, or malformed/wrong closing
-            // tag) so the model can self-correct instead of repeating it.
-            const names = getAllDestinations().map((d) => d.name);
-            log(
-              `Discarded response (re-prompt ${unwrappedRetries}/${MAX_UNWRAPPED_RETRIES}) — ` +
-                (unknownDestinations.length
-                  ? `unknown destination(s): ${unknownDestinations.join(', ')}; valid: ${names.join(', ')}`
-                  : `no deliverable <message> block`),
-            );
-            query.push(buildRewrapReminder(unknownDestinations, names));
-          } else if (hasUnwrapped) {
-            // PATCH 12: cap exhausted — give up LOUDLY rather than silently
-            // idling until the next inbound wakes the turn.
-            log(
-              `WARNING: response still not deliverable after ${unwrappedRetries} re-prompt(s) — giving up; ` +
-                `the user gets no reply for this turn` +
-                (unknownDestinations.length ? ` (unknown destination(s): ${unknownDestinations.join(', ')})` : ''),
-            );
+          const { sent, hasUnwrapped, unknownDestinations } = dispatchResultText(event.text, routing);
+          if (sent === 0 && event.isError === true) {
+            // Non-retryable error turn (e.g. a 403 billing_error) with no
+            // <message> envelope: deliver the notice instead of dropping it as
+            // scratchpad, and skip the re-wrap nudge — it would just re-hammer
+            // the failing gateway turn after turn.
+            deliverErrorResult(event.text, routing);
+            notifyExchangeComplete(onExchangeComplete, {
+              prompt: archivePrompts[0] ?? initialPrompt,
+              result: event.text,
+              continuation: queryContinuation ?? initialContinuation,
+              status: 'error',
+            });
+            archivePrompts.shift();
+          } else {
+            // PATCH 12: cap re-prompts with a COUNTER (was a single bool, so the
+            // turn gave up after one retry and idled until the next inbound).
+            const willRetryWrapping = hasUnwrapped && unwrappedRetries < MAX_UNWRAPPED_RETRIES;
+            notifyExchangeComplete(onExchangeComplete, {
+              prompt: archivePrompts[0] ?? initialPrompt,
+              result: event.text,
+              continuation: queryContinuation ?? initialContinuation,
+              status: hasUnwrapped ? 'undelivered' : 'completed',
+            });
+            if (willRetryWrapping) {
+              unwrappedRetries++;
+              // PATCH 12: re-prompt IN-TURN with SPECIFIC feedback (the real
+              // reason — unknown destination name, or malformed/wrong closing
+              // tag) so the model can self-correct instead of repeating it.
+              const names = getAllDestinations().map((d) => d.name);
+              log(
+                `Discarded response (re-prompt ${unwrappedRetries}/${MAX_UNWRAPPED_RETRIES}) — ` +
+                  (unknownDestinations.length
+                    ? `unknown destination(s): ${unknownDestinations.join(', ')}; valid: ${names.join(', ')}`
+                    : `no deliverable <message> block`),
+              );
+              query.push(buildRewrapReminder(unknownDestinations, names));
+            } else if (hasUnwrapped) {
+              // PATCH 12: cap exhausted — give up LOUDLY rather than silently
+              // idling until the next inbound wakes the turn.
+              log(
+                `WARNING: response still not deliverable after ${unwrappedRetries} re-prompt(s) — giving up; ` +
+                  `the user gets no reply for this turn` +
+                  (unknownDestinations.length ? ` (unknown destination(s): ${unknownDestinations.join(', ')})` : ''),
+              );
+            }
+            // The wrapping-retry result answers the SAME user prompt — keep it
+            // queued so the retry archives against it, not the nudge text.
+            if (!willRetryWrapping) archivePrompts.shift();
           }
-          // The wrapping-retry result answers the SAME user prompt — keep it
-          // queued so the retry archives against it, not the nudge text.
-          if (!willRetryWrapping) archivePrompts.shift();
         } else {
           archivePrompts.shift();
         }
@@ -572,6 +587,26 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       log(`Progress: ${event.message}`);
       break;
   }
+}
+
+/**
+ * Deliver a turn's text straight to the channel the batch arrived on. Used when
+ * a turn ends in a provider error (e.g. a non-retryable 403 billing_error) with
+ * no <message> envelope: the notice would otherwise be dropped as scratchpad.
+ * This is the same user-facing write the outer catch block does, minus the
+ * `Error:` prefix — the provider's text is already a user-facing message.
+ */
+function deliverErrorResult(text: string, routing: RoutingContext): void {
+  log('Error result with no <message> envelope — delivering to channel');
+  writeMessageOut({
+    id: generateId(),
+    in_reply_to: routing.inReplyTo,
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text }),
+  });
 }
 
 /**

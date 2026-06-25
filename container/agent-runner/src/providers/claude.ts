@@ -462,12 +462,20 @@ export class ClaudeProvider implements AgentProvider {
           // messages carry parent_tool_use_id and are excluded).
           turnText = appendTurnText(turnText, extractMainAgentText(message as AssistantLikeMessage));
         } else if (message.type === 'result') {
-          const resultText = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          // PATCH 11: dispatch from the full accumulated turn text (a superset of
-          // result.result), falling back to result.result if nothing was captured.
-          const text = resolveTurnDispatchText(turnText, resultText);
+          // MERGE (PATCH 11 + upstream error-surfacing): `result` text exists
+          // only on subtype:"success"; error subtypes (e.g. a non-retryable 403
+          // billing_error) carry their message in `errors[]` instead.
+          const m = message as { result?: string; is_error?: boolean; errors?: string[] };
+          const isError = m.is_error === true;
+          const resultText = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
+          // On an ERROR turn, surface the error text directly so the poll-loop
+          // can deliver the billing/quota notice — don't let accumulated
+          // pre-error scratchpad mask it. On a NORMAL turn, PATCH 11: dispatch
+          // from the full accumulated turn text (a superset of result.result),
+          // falling back to resultText if nothing was captured.
+          const text = isError ? resultText : resolveTurnDispatchText(turnText, resultText);
           turnText = '';
-          yield { type: 'result', text };
+          yield { type: 'result', text, isError };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
