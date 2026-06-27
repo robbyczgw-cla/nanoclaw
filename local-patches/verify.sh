@@ -128,6 +128,14 @@ else
   ALL_OK=false
 fi
 
+# Patch 14 — /learn available as a runtime skill in agent containers
+if grep -q '^name: learn' container/skills/learn/SKILL.md 2>/dev/null; then
+  echo "✅ 14-learn-container-skill applied"
+else
+  echo "❌ 14-learn-container-skill MISSING"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

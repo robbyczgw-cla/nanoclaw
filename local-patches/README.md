@@ -23,6 +23,7 @@ This directory tracks every local source-code modification applied to `/root/nan
 | 11 | `container/agent-runner/src/providers/{claude,turn-text}.ts` + `poll-loop.ts` | `<message>` block enqueue fix (dispatch full turn text, not just result.result) | none (local-only) | 🟢 local-only |
 | 12 | `container/agent-runner/src/{message-blocks,poll-loop}.ts` | Turn-stall fix (tolerant `</parameter>`/`</invoke>` parse + capped in-turn re-prompt + specific feedback) | none (local-only) | 🟢 local-only |
 | 13 | `container/agent-runner/src/message-blocks.ts` | Tolerant parse tail-strip (no mid-body cut on a quoted `</parameter>`/`</invoke>`) | none (local-only) | 🟢 local-only |
+| 14 | `container/skills/learn/SKILL.md` | `/learn` as a runtime skill in agent containers (copied from `.claude/skills/`, which isn't mounted into containers) | none (upstream ships it only at dev level) | 🟢 local-only |
 
 **Apply order matters:** 02 must be applied before 03 — 03's apply-script anchors on strings introduced by 02. Patch 01 is independent of 02/03.
 
@@ -118,6 +119,7 @@ If any return 0, the patch was wiped — re-apply via the workflow above.
 
 ## History (newest first)
 
+- **2026-06-27** — Patch 14 applied (`/learn` runtime skill: PR #2843 shipped `/learn` only at `.claude/skills/` (dev level), which isn't mounted into agent containers; copied it to `container/skills/learn/` — the volume-mounted runtime skill path — so it auto-selects for all `skills:"all"` groups on next spawn. No image rebuild, no orchestrator restart; container respawn suffices)
 - **2026-06-17** — Patch 13 applied (edge-case fix for patch 12: tolerant `<message>` parse now prefers `</message>` and only strips a TRAILING stray `</parameter>`/`</invoke>` — a quoted tag mid-body no longer truncates the message; ground truth was a confirmation that quoted the tag in backticks)
 - **2026-06-17** — Patch 12 applied (turn-stall on rejected response: tolerant `</parameter>`/`</invoke>` closing-tag parsing eliminates the reported trigger; re-prompt cap is now a counter (2) with SPECIFIC feedback naming the bad destination/tag, and gives up loudly instead of idling until the next inbound)
 - **2026-06-16** — Patch 11 applied (`<message>` block enqueue fix: accumulate full main-agent turn text and dispatch from it instead of only the SDK `result.result` final text, so a `<message>` block emitted before a trailing tool_use on long tool chains no longer vanishes silently; + loud-fail guard for malformed blocks)
