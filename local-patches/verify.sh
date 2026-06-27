@@ -136,6 +136,15 @@ else
   ALL_OK=false
 fi
 
+# Patch 15 — claude.ts local default model (opus-4-8) + auto-compact window (900k)
+if grep -q "ANTHROPIC_MODEL ?? 'claude-opus-4-8'" container/agent-runner/src/providers/claude.ts 2>/dev/null \
+   && grep -q "|| '900000'" container/agent-runner/src/providers/claude.ts 2>/dev/null; then
+  echo "✅ 15-claude-default-model-and-compact-window applied"
+else
+  echo "❌ 15-claude-default-model-and-compact-window MISSING (or partial — check model fallback + compact window)"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

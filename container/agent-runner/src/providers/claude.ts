@@ -327,10 +327,10 @@ function transcriptStartMs(transcriptPath: string): number | null {
  * with a 1M-context model variant or when emergency-tuning a deployment.
  *
  * Local default: 900000 (90% of 1M, leaves 100k headroom). Tuned for the
- * 1M-context Opus 4.7 variant set as model default below — without this
- * override the SDK would compact at 16.5% of context every turn. Tracked
- * as local-patches/ entry so future-Claude knows why we drift from
- * upstream's 165000 here.
+ * 1M-context Opus 4.8 default model set below (claude-opus-4-8 is 1M-context
+ * by default — no [1m] suffix needed) — without this override the SDK would
+ * compact at 16.5% of context every turn. Tracked as local-patches/ entry so
+ * future-Claude knows why we drift from upstream's 165000 here.
  */
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '900000';
 
@@ -423,7 +423,7 @@ export class ClaudeProvider implements AgentProvider {
         ],
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: this.env,
-        model: this.model ?? process.env.ANTHROPIC_MODEL ?? 'claude-opus-4-7[1m]',
+        model: this.model ?? process.env.ANTHROPIC_MODEL ?? 'claude-opus-4-8',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         effort: this.effort as any,
         permissionMode: 'bypassPermissions',
