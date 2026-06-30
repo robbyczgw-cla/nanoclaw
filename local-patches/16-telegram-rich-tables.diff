@@ -1,0 +1,91 @@
+--- a/src/channels/telegram.ts
++++ b/src/channels/telegram.ts
+@@ -12,6 +12,13 @@
+ import { upsertUser } from '../modules/permissions/db/users.js';
+ import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
+ import { telegramV1ToCommonMark } from './telegram-markdown-v2.js';
++import {
++  isTablePrimary,
++  isRichCapabilityError,
++  richTablesEnabled,
++  sendRichMessageRaw,
++  RICH_MESSAGE_MAX_CHARS,
++} from './telegram-rich-message.js';
+ import { registerChannelAdapter } from './channel-registry.js';
+ import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
+ import { tryConsume } from './telegram-pairing.js';
+@@ -216,9 +223,16 @@
+  * @chat-adapter/telegram to >=4.30 (legacy "Markdown" -> escaped "MarkdownV2")
+  * and dropping sanitizeTelegramLegacyMarkdown; remove this wrapper then.
+  */
+-function makeResilientTelegramSend<A extends { postMessage: (...args: any[]) => Promise<any> }>(adapter: A): A {
++function makeResilientTelegramSend<A extends { postMessage: (...args: any[]) => Promise<any> }>(
++  adapter: A,
++  token: string,
++  richEnabled: boolean,
++): A {
+   const origPost = adapter.postMessage.bind(adapter) as (tid: string, m: any) => Promise<any>;
+   const stripMarkdown = (s: string): string => s.replace(/[*_`[\]]/g, '');
++  // PATCH 16: latched off after a capability failure on sendRichMessage (a Bot
++  // API server without 10.1) so later sends skip the doomed rich attempt.
++  let richDisabled = false;
+   const isRateLimit = (e: unknown): boolean => {
+     const any = e as { name?: string; message?: string };
+     return (
+@@ -231,6 +245,38 @@
+   };
+   const errText = (e: unknown): string => String((e as { message?: string })?.message ?? e);
+   adapter.postMessage = (async (tid: string, message: any): Promise<any> => {
++    // PATCH 16: route table-primary text messages to Bot API 10.1
++    // sendRichMessage so GFM tables render natively instead of degrading to a
++    // monospace code block under MarkdownV2. Any failure → fall through to the
++    // normal path below (message is never lost).
++    const richMd = typeof message?.markdown === 'string' ? message.markdown : '';
++    const hasMedia = !!(message?.attachments?.length || message?.files?.length);
++    if (
++      richEnabled &&
++      !richDisabled &&
++      richMd.length > 0 &&
++      richMd.length <= RICH_MESSAGE_MAX_CHARS &&
++      !hasMedia &&
++      isTablePrimary(richMd)
++    ) {
++      try {
++        return await sendRichMessageRaw({ token }, tid, richMd);
++      } catch (re: unknown) {
++        if (isRichCapabilityError(re)) {
++          richDisabled = true;
++          log.warn('Telegram sendRichMessage unsupported — latching rich OFF, using MarkdownV2', {
++            tid,
++            err: String((re as { message?: string })?.message ?? re),
++          });
++        } else {
++          log.warn('Telegram sendRichMessage failed — falling back to MarkdownV2', {
++            tid,
++            err: String((re as { message?: string })?.message ?? re),
++          });
++        }
++        // fall through to the normal send path
++      }
++    }
+     try {
+       return await origPost(tid, message);
+     } catch (err: unknown) {
+@@ -265,7 +311,7 @@
+ 
+ registerChannelAdapter('telegram', {
+   factory: () => {
+-    const env = readEnvFile(['TELEGRAM_BOT_TOKEN']);
++    const env = readEnvFile(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_RICH_TABLES']);
+     if (!env.TELEGRAM_BOT_TOKEN) return null;
+     const token = env.TELEGRAM_BOT_TOKEN;
+     const telegramAdapter = makeResilientTelegramSend(
+@@ -273,6 +319,8 @@
+         botToken: token,
+         mode: 'polling',
+       }),
++      token,
++      richTablesEnabled(env),
+     );
+     const bridge = createChatSdkBridge({
+       adapter: telegramAdapter,

@@ -23,6 +23,7 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
+import { buildCollapsedToolVis } from './telegram-rich-message.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
@@ -92,6 +93,14 @@ export interface ChatSdkBridgeConfig {
    * (which rides as the caption) tighter than the rest.
    */
   maxCaptionLength?: number;
+  /**
+   * PATCH 17: when true, a finished turn collapses its tool-visibility bubble
+   * into a `<details>` fold (one final edit) instead of leaving the full
+   * per-tool-call timeline expanded. The summary stays visible; the timeline
+   * hides behind a tap. Set only by adapters whose edit path renders `<details>`
+   * natively (Telegram via Bot API 10.1 rich messages). Default off.
+   */
+  collapseToolVis?: boolean;
 }
 
 /**
@@ -317,6 +326,27 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     if (acc.pendingTimer) {
       clearTimeout(acc.pendingTimer);
       acc.pendingTimer = null;
+    }
+    // PATCH 17: collapse the completed timeline into a <details> fold via one
+    // final edit, so the chat keeps only a compact "🔧 N Tool-Calls — aufklappen"
+    // summary with the per-call detail one tap away. The adapter's edit path
+    // routes <details> through the rich (Bot API 10.1) path; if that or the edit
+    // fails, fall back to the plain final flush so the bubble is never lost.
+    if (config.collapseToolVis && acc.lines.length > 0) {
+      const folded = buildCollapsedToolVis(acc.lines);
+      if (folded) {
+        try {
+          await adapter.editMessage(tid, acc.messageId, { markdown: folded });
+          acc.dirty = false;
+          toolVisAccumulators.delete(accumKey);
+          return;
+        } catch (err) {
+          log.warn('Tool-vis collapse edit failed — falling back to expanded flush', {
+            err: err instanceof Error ? err.message : String(err),
+            adapter: adapter.name,
+          });
+        }
+      }
     }
     await flushToolVis(tid, accumKey);
     toolVisAccumulators.delete(accumKey);

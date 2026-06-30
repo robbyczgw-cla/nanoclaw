@@ -12,6 +12,19 @@ import { grantRole, hasAnyOwner } from '../modules/permissions/db/user-roles.js'
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { telegramV1ToCommonMark } from './telegram-markdown-v2.js';
+import {
+  isTablePrimary,
+  isRichCapabilityError,
+  richTablesEnabled,
+  richConstructsEnabled,
+  hasRichOnlyConstruct,
+  hasTDesktopCrashShape,
+  sendRichMessageRaw,
+  editRichMessageRaw,
+  hasDetailsFold,
+  toolVisCollapseEnabled,
+  RICH_MESSAGE_MAX_CHARS,
+} from './telegram-rich-message.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
 import { tryConsume } from './telegram-pairing.js';
@@ -216,9 +229,17 @@ function createPairingInterceptor(
  * @chat-adapter/telegram to >=4.30 (legacy "Markdown" -> escaped "MarkdownV2")
  * and dropping sanitizeTelegramLegacyMarkdown; remove this wrapper then.
  */
-function makeResilientTelegramSend<A extends { postMessage: (...args: any[]) => Promise<any> }>(adapter: A): A {
+function makeResilientTelegramSend<
+  A extends {
+    postMessage: (...args: any[]) => Promise<any>;
+    editMessage?: (...args: any[]) => Promise<any>;
+  },
+>(adapter: A, token: string, richEnabled: boolean, richConstructs: boolean): A {
   const origPost = adapter.postMessage.bind(adapter) as (tid: string, m: any) => Promise<any>;
   const stripMarkdown = (s: string): string => s.replace(/[*_`[\]]/g, '');
+  // PATCH 16: latched off after a capability failure on sendRichMessage (a Bot
+  // API server without 10.1) so later sends skip the doomed rich attempt.
+  let richDisabled = false;
   const isRateLimit = (e: unknown): boolean => {
     const any = e as { name?: string; message?: string };
     return (
@@ -231,6 +252,44 @@ function makeResilientTelegramSend<A extends { postMessage: (...args: any[]) => 
   };
   const errText = (e: unknown): string => String((e as { message?: string })?.message ?? e);
   adapter.postMessage = (async (tid: string, message: any): Promise<any> => {
+    // PATCH 16: route table-primary text messages to Bot API 10.1
+    // sendRichMessage so GFM tables render natively instead of degrading to a
+    // monospace code block under MarkdownV2. Any failure → fall through to the
+    // normal path below (message is never lost).
+    const richMd = typeof message?.markdown === 'string' ? message.markdown : '';
+    const hasMedia = !!(message?.attachments?.length || message?.files?.length);
+    // PATCH 18: also route messages carrying a MarkdownV2-impossible construct
+    // (heading / <details> / divider / block math / task list) to the rich path,
+    // gated by `richConstructs`. The TDesktop details+math crash shape is excluded
+    // so it degrades to MarkdownV2 instead of crashing the client.
+    const routeRich =
+      isTablePrimary(richMd) || (richConstructs && hasRichOnlyConstruct(richMd) && !hasTDesktopCrashShape(richMd));
+    if (
+      richEnabled &&
+      !richDisabled &&
+      richMd.length > 0 &&
+      richMd.length <= RICH_MESSAGE_MAX_CHARS &&
+      !hasMedia &&
+      routeRich
+    ) {
+      try {
+        return await sendRichMessageRaw({ token }, tid, richMd);
+      } catch (re: unknown) {
+        if (isRichCapabilityError(re)) {
+          richDisabled = true;
+          log.warn('Telegram sendRichMessage unsupported — latching rich OFF, using MarkdownV2', {
+            tid,
+            err: String((re as { message?: string })?.message ?? re),
+          });
+        } else {
+          log.warn('Telegram sendRichMessage failed — falling back to MarkdownV2', {
+            tid,
+            err: String((re as { message?: string })?.message ?? re),
+          });
+        }
+        // fall through to the normal send path
+      }
+    }
     try {
       return await origPost(tid, message);
     } catch (err: unknown) {
@@ -260,12 +319,55 @@ function makeResilientTelegramSend<A extends { postMessage: (...args: any[]) => 
       throw last;
     }
   }) as A['postMessage'];
+
+  // PATCH 17: route edits that carry a collapsible <details> fold (the tool-vis
+  // collapse on turn-end) through Bot API 10.1 editMessageText + rich_message so
+  // the fold renders natively. Any failure falls through to the normal edit path
+  // (the bubble just stays expanded — never lost). Other edits are untouched.
+  if (typeof adapter.editMessage === 'function') {
+    const origEdit = adapter.editMessage.bind(adapter) as (tid: string, mid: string, m: any) => Promise<any>;
+    adapter.editMessage = (async (tid: string, mid: string, message: any): Promise<any> => {
+      const richMd = typeof message?.markdown === 'string' ? message.markdown : '';
+      if (
+        richEnabled &&
+        !richDisabled &&
+        richMd.length > 0 &&
+        richMd.length <= RICH_MESSAGE_MAX_CHARS &&
+        hasDetailsFold(richMd)
+      ) {
+        try {
+          return await editRichMessageRaw({ token }, tid, mid, richMd);
+        } catch (re: unknown) {
+          if (isRichCapabilityError(re)) {
+            richDisabled = true;
+            log.warn('Telegram editMessageText rich unsupported — latching rich OFF', {
+              tid,
+              err: String((re as { message?: string })?.message ?? re),
+            });
+          } else {
+            log.warn('Telegram rich edit failed — falling back to normal edit', {
+              tid,
+              err: String((re as { message?: string })?.message ?? re),
+            });
+          }
+          // fall through to the normal edit path
+        }
+      }
+      return await origEdit(tid, mid, message);
+    }) as A['editMessage'];
+  }
+
   return adapter;
 }
 
 registerChannelAdapter('telegram', {
   factory: () => {
-    const env = readEnvFile(['TELEGRAM_BOT_TOKEN']);
+    const env = readEnvFile([
+      'TELEGRAM_BOT_TOKEN',
+      'TELEGRAM_RICH_TABLES',
+      'TELEGRAM_RICH_CONSTRUCTS',
+      'TELEGRAM_TOOLVIS_COLLAPSE',
+    ]);
     if (!env.TELEGRAM_BOT_TOKEN) return null;
     const token = env.TELEGRAM_BOT_TOKEN;
     const telegramAdapter = makeResilientTelegramSend(
@@ -273,6 +375,9 @@ registerChannelAdapter('telegram', {
         botToken: token,
         mode: 'polling',
       }),
+      token,
+      richTablesEnabled(env),
+      richTablesEnabled(env) && richConstructsEnabled(env),
     );
     const bridge = createChatSdkBridge({
       adapter: telegramAdapter,
@@ -282,6 +387,9 @@ registerChannelAdapter('telegram', {
       transformOutboundText: telegramV1ToCommonMark,
       maxTextLength: 4000,
       maxCaptionLength: 1000, // PATCH 08: Telegram sendDocument.caption hard limit is 1024, leave 24-char safety buffer
+      // PATCH 17: collapse the tool-vis bubble into a <details> fold on turn-end
+      // (rich tables must be enabled too, since the fold renders via the rich path).
+      collapseToolVis: richTablesEnabled(env) && toolVisCollapseEnabled(env),
     });
 
     const botUsernamePromise = fetchBotUsername(token);

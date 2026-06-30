@@ -97,6 +97,9 @@ async function main(): Promise<void> {
   cleanupOrphans();
 
   // 3. Channel adapters
+  const { startWebChat } = await import('./webchat-boot.js');
+  await startWebChat();
+
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {

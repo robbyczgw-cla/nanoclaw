@@ -145,6 +145,31 @@ else
   ALL_OK=false
 fi
 
+# Patch 16 — native Telegram tables via Bot API 10.1 sendRichMessage
+if grep -q 'sendRichMessageRaw' src/channels/telegram.ts 2>/dev/null \
+   && [ -f src/channels/telegram-rich-message.ts ]; then
+  echo "✅ 16-telegram-rich-tables applied"
+else
+  echo "❌ 16-telegram-rich-tables MISSING"
+  ALL_OK=false
+fi
+
+# Patch 17 — collapse tool-vis timeline into a <details> fold
+if grep -q 'editRichMessageRaw' src/channels/telegram-rich-message.ts 2>/dev/null && grep -q 'collapseToolVis' src/channels/chat-sdk-bridge.ts 2>/dev/null; then
+  echo "✅ 17-toolvis-collapse-fold applied"
+else
+  echo "❌ 17-toolvis-collapse-fold MISSING"
+  ALL_OK=false
+fi
+
+# Patch 18 — broaden rich routing to MarkdownV2-impossible constructs
+if grep -q 'hasRichOnlyConstruct' src/channels/telegram-rich-message.ts 2>/dev/null && grep -q 'richConstructs' src/channels/telegram.ts 2>/dev/null; then
+  echo "✅ 18-telegram-rich-constructs applied"
+else
+  echo "❌ 18-telegram-rich-constructs MISSING"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

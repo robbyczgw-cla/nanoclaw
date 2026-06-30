@@ -1,0 +1,536 @@
+--- telegram-rich-message.ts.p17bak-20260627-221901	2026-06-27 20:19:01.768118037 +0000
++++ telegram-rich-message.ts	2026-06-27 20:56:43.795330283 +0000
+@@ -58,7 +58,13 @@
+   const code = (e as { errorCode?: number })?.errorCode;
+   const msg = String((e as { message?: string })?.message ?? e);
+   if (code === 404) return true;
+-  return /unknown method|method not found|not found|unsupported/i.test(msg) && /rich/i.test(msg);
++  // ONLY latch off on a genuine "this Bot API server has no rich-message method"
++  // signal. NOT per-message 400s like "chat not found" / "message to edit not
++  // found" — those must fall back for that one message WITHOUT killing rich
++  // process-wide. CAUTION: our own error text contains "RichMessage", so we must
++  // never key off a bare /rich/ match (that misclassified every per-message 400
++  // → latched rich OFF after the first benign failure — the PATCH 17 launch bug).
++  return /unknown method|method not found|method is not (available|supported)/i.test(msg);
+ }
+ 
+ export interface RichSendDeps {
+@@ -67,6 +73,18 @@
+ }
+ 
+ /**
++ * Resolve a Telegram Bot API `chat_id` from the bridge thread id. The bridge
++ * passes `tid` = `platformId` = `telegram:<chatId>` (see telegram.ts) — the
++ * normal adapter strips the prefix internally; the rich endpoints need the same.
++ * Handles a bare numeric id too (no prefix). Returns a number for numeric ids
++ * (Telegram wants the integer form) or the raw string otherwise.
++ */
++export function chatIdFromTid(tid: string): number | string {
++  const raw = tid.includes(':') ? tid.split(':').slice(1).join(':') : tid;
++  return /^-?\d+$/.test(raw) ? Number(raw) : raw;
++}
++
++/**
+  * Send `markdown` via Bot API 10.1 `sendRichMessage`. Returns a RawMessage in
+  * the same shape the chat-sdk bridge expects from `adapter.postMessage`.
+  * Throws on a non-`ok` Bot API response (caller decides fallback).
+@@ -79,7 +97,7 @@
+ ): Promise<RawMessage<unknown>> {
+   const doFetch = deps.fetchImpl ?? fetch;
+   const payload: Record<string, unknown> = {
+-    chat_id: /^-?\d+$/.test(chatId) ? Number(chatId) : chatId,
++    chat_id: chatIdFromTid(chatId),
+     // RAW markdown — never the MarkdownV2-escaped form, which would destroy pipes.
+     rich_message: { markdown },
+   };
+@@ -106,3 +124,98 @@
+   }
+   return { id: String(json.result.message_id), raw: json.result as unknown, threadId: chatId };
+ }
++
++/**
++ * PATCH 17 — edit an existing message via Bot API 10.1 `editMessageText` with a
++ * `rich_message` payload, so a previously-plain bubble can be re-rendered with
++ * native rich constructs (e.g. a collapsible `<details>` fold). Verified: a
++ * MarkdownV2 message edits cleanly into a rich details block. Throws on a
++ * non-`ok` response (caller decides fallback to the normal edit path).
++ */
++export async function editRichMessageRaw(
++  deps: RichSendDeps,
++  tid: string,
++  messageId: string,
++  markdown: string,
++): Promise<RawMessage<unknown>> {
++  const doFetch = deps.fetchImpl ?? fetch;
++  const target = decodeRichEditTarget(messageId, tid);
++  const payload = {
++    chat_id: target.chatId,
++    message_id: target.messageId,
++    rich_message: { markdown },
++  };
++  const res = await doFetch(`https://api.telegram.org/bot${deps.token}/editMessageText`, {
++    method: 'POST',
++    headers: { 'content-type': 'application/json' },
++    body: JSON.stringify(payload),
++  });
++  const json = (await res.json()) as {
++    ok: boolean;
++    result?: { message_id?: number } | boolean;
++    description?: string;
++    error_code?: number;
++  };
++  if (!json.ok) {
++    const err = new Error(
++      `editRichMessage failed: ${json.error_code ?? res.status} ${json.description ?? ''}`.trim(),
++    );
++    (err as { errorCode?: number }).errorCode = json.error_code ?? res.status;
++    throw err;
++  }
++  const result = typeof json.result === 'object' && json.result ? json.result : undefined;
++  const id = result?.message_id != null ? String(result.message_id) : messageId;
++  return { id, raw: (result ?? json.result) as unknown, threadId: tid };
++}
++
++/**
++ * Decode the chat-sdk telegram adapter's composite message id. The adapter
++ * stores ids as `<chatId>:<messageId>` (see its `decodeCompositeMessageId`),
++ * but the raw `editMessageText` endpoint needs the bare integer `message_id`
++ * and numeric `chat_id`. A naive `Number(composite)` yields NaN → Telegram
++ * "message to edit not found" (the second PATCH 17 launch bug). Falls back to
++ * the thread id for chat when the id is already a bare integer.
++ */
++export function decodeRichEditTarget(
++  messageId: string,
++  tid: string,
++): { chatId: number | string; messageId: number } {
++  const i = messageId.lastIndexOf(':');
++  if (i > 0 && i < messageId.length - 1) {
++    const chatPart = messageId.slice(0, i);
++    const msgPart = messageId.slice(i + 1);
++    if (/^-?\d+$/.test(chatPart) && /^\d+$/.test(msgPart)) {
++      return { chatId: Number(chatPart), messageId: Number(msgPart) };
++    }
++  }
++  return { chatId: chatIdFromTid(tid), messageId: Number(messageId) };
++}
++
++/** True when the markdown carries a collapsible `<details>` fold — the only
++ *  construct PATCH 17 routes through the rich EDIT path. Kept narrow so generic
++ *  edits stay on the normal (MarkdownV2) path; broader routing is PATCH 18. */
++export function hasDetailsFold(markdown: string): boolean {
++  return /<details\b/i.test(markdown);
++}
++
++/** Read the TELEGRAM_TOOLVIS_COLLAPSE toggle (default ON). When on, a finished
++ *  turn collapses its tool-visibility bubble into a `<details>` fold. */
++export function toolVisCollapseEnabled(env: Record<string, string | undefined>): boolean {
++  const v = (env.TELEGRAM_TOOLVIS_COLLAPSE ?? '').toLowerCase();
++  return v !== 'false' && v !== '0' && v !== 'off' && v !== 'no';
++}
++
++/**
++ * PATCH 17 — wrap accumulated tool-visibility lines in a collapsed `<details>`
++ * fold. The summary stays visible (so the user knows work happened + can
++ * inspect it); the per-call timeline hides behind a tap. Tool-vis lines never
++ * contain block math, so the Telegram-Desktop details+math crash shape can't
++ * arise here. Returns the original text unchanged when there are no lines.
++ */
++export function buildCollapsedToolVis(lines: string[]): string {
++  const clean = lines.map((l) => l.trim()).filter((l) => l.length > 0);
++  if (clean.length === 0) return '';
++  const n = clean.length;
++  const summary = `🔧 ${n} Tool-Call${n === 1 ? '' : 's'} — aufklappen`;
++  return `<details><summary>${summary}</summary>\n\n${clean.join('\n')}\n\n</details>`;
++}
+--- telegram.ts.p17bak-20260627-221901	2026-06-27 20:19:01.771422090 +0000
++++ telegram.ts	2026-06-27 20:19:02.593999829 +0000
+@@ -17,6 +17,9 @@
+   isRichCapabilityError,
+   richTablesEnabled,
+   sendRichMessageRaw,
++  editRichMessageRaw,
++  hasDetailsFold,
++  toolVisCollapseEnabled,
+   RICH_MESSAGE_MAX_CHARS,
+ } from './telegram-rich-message.js';
+ import { registerChannelAdapter } from './channel-registry.js';
+@@ -223,11 +226,12 @@
+  * @chat-adapter/telegram to >=4.30 (legacy "Markdown" -> escaped "MarkdownV2")
+  * and dropping sanitizeTelegramLegacyMarkdown; remove this wrapper then.
+  */
+-function makeResilientTelegramSend<A extends { postMessage: (...args: any[]) => Promise<any> }>(
+-  adapter: A,
+-  token: string,
+-  richEnabled: boolean,
+-): A {
++function makeResilientTelegramSend<
++  A extends {
++    postMessage: (...args: any[]) => Promise<any>;
++    editMessage?: (...args: any[]) => Promise<any>;
++  },
++>(adapter: A, token: string, richEnabled: boolean): A {
+   const origPost = adapter.postMessage.bind(adapter) as (tid: string, m: any) => Promise<any>;
+   const stripMarkdown = (s: string): string => s.replace(/[*_`[\]]/g, '');
+   // PATCH 16: latched off after a capability failure on sendRichMessage (a Bot
+@@ -306,12 +310,50 @@
+       throw last;
+     }
+   }) as A['postMessage'];
++
++  // PATCH 17: route edits that carry a collapsible <details> fold (the tool-vis
++  // collapse on turn-end) through Bot API 10.1 editMessageText + rich_message so
++  // the fold renders natively. Any failure falls through to the normal edit path
++  // (the bubble just stays expanded — never lost). Other edits are untouched.
++  if (typeof adapter.editMessage === 'function') {
++    const origEdit = adapter.editMessage.bind(adapter) as (tid: string, mid: string, m: any) => Promise<any>;
++    adapter.editMessage = (async (tid: string, mid: string, message: any): Promise<any> => {
++      const richMd = typeof message?.markdown === 'string' ? message.markdown : '';
++      if (
++        richEnabled &&
++        !richDisabled &&
++        richMd.length > 0 &&
++        richMd.length <= RICH_MESSAGE_MAX_CHARS &&
++        hasDetailsFold(richMd)
++      ) {
++        try {
++          return await editRichMessageRaw({ token }, tid, mid, richMd);
++        } catch (re: unknown) {
++          if (isRichCapabilityError(re)) {
++            richDisabled = true;
++            log.warn('Telegram editMessageText rich unsupported — latching rich OFF', {
++              tid,
++              err: String((re as { message?: string })?.message ?? re),
++            });
++          } else {
++            log.warn('Telegram rich edit failed — falling back to normal edit', {
++              tid,
++              err: String((re as { message?: string })?.message ?? re),
++            });
++          }
++          // fall through to the normal edit path
++        }
++      }
++      return await origEdit(tid, mid, message);
++    }) as A['editMessage'];
++  }
++
+   return adapter;
+ }
+ 
+ registerChannelAdapter('telegram', {
+   factory: () => {
+-    const env = readEnvFile(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_RICH_TABLES']);
++    const env = readEnvFile(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_RICH_TABLES', 'TELEGRAM_TOOLVIS_COLLAPSE']);
+     if (!env.TELEGRAM_BOT_TOKEN) return null;
+     const token = env.TELEGRAM_BOT_TOKEN;
+     const telegramAdapter = makeResilientTelegramSend(
+@@ -330,6 +372,9 @@
+       transformOutboundText: telegramV1ToCommonMark,
+       maxTextLength: 4000,
+       maxCaptionLength: 1000, // PATCH 08: Telegram sendDocument.caption hard limit is 1024, leave 24-char safety buffer
++      // PATCH 17: collapse the tool-vis bubble into a <details> fold on turn-end
++      // (rich tables must be enabled too, since the fold renders via the rich path).
++      collapseToolVis: richTablesEnabled(env) && toolVisCollapseEnabled(env),
+     });
+ 
+     const botUsernamePromise = fetchBotUsername(token);
+--- chat-sdk-bridge.ts.p17bak-20260627-221901	2026-06-27 20:19:01.773197285 +0000
++++ chat-sdk-bridge.ts	2026-06-27 20:19:02.869002352 +0000
+@@ -23,6 +23,7 @@
+ import { registerWebhookAdapter } from '../webhook-server.js';
+ import { getAskQuestionRender } from '../db/sessions.js';
+ import { normalizeOptions, type NormalizedOption } from './ask-question.js';
++import { buildCollapsedToolVis } from './telegram-rich-message.js';
+ import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
+ 
+ /** Adapter with optional gateway support (e.g., Discord). */
+@@ -92,6 +93,14 @@
+    * (which rides as the caption) tighter than the rest.
+    */
+   maxCaptionLength?: number;
++  /**
++   * PATCH 17: when true, a finished turn collapses its tool-visibility bubble
++   * into a `<details>` fold (one final edit) instead of leaving the full
++   * per-tool-call timeline expanded. The summary stays visible; the timeline
++   * hides behind a tap. Set only by adapters whose edit path renders `<details>`
++   * natively (Telegram via Bot API 10.1 rich messages). Default off.
++   */
++  collapseToolVis?: boolean;
+ }
+ 
+ /**
+@@ -318,6 +327,27 @@
+       clearTimeout(acc.pendingTimer);
+       acc.pendingTimer = null;
+     }
++    // PATCH 17: collapse the completed timeline into a <details> fold via one
++    // final edit, so the chat keeps only a compact "🔧 N Tool-Calls — aufklappen"
++    // summary with the per-call detail one tap away. The adapter's edit path
++    // routes <details> through the rich (Bot API 10.1) path; if that or the edit
++    // fails, fall back to the plain final flush so the bubble is never lost.
++    if (config.collapseToolVis && acc.lines.length > 0) {
++      const folded = buildCollapsedToolVis(acc.lines);
++      if (folded) {
++        try {
++          await adapter.editMessage(tid, acc.messageId, { markdown: folded });
++          acc.dirty = false;
++          toolVisAccumulators.delete(accumKey);
++          return;
++        } catch (err) {
++          log.warn('Tool-vis collapse edit failed — falling back to expanded flush', {
++            err: err instanceof Error ? err.message : String(err),
++            adapter: adapter.name,
++          });
++        }
++      }
++    }
+     await flushToolVis(tid, accumKey);
+     toolVisAccumulators.delete(accumKey);
+   }
+--- telegram-rich-message.test.ts.p17bak-20260627-221901	2026-06-27 20:19:01.769801388 +0000
++++ telegram-rich-message.test.ts	2026-06-27 20:56:44.055333122 +0000
+@@ -4,6 +4,12 @@
+   richTablesEnabled,
+   isRichCapabilityError,
+   sendRichMessageRaw,
++  editRichMessageRaw,
++  chatIdFromTid,
++  decodeRichEditTarget,
++  hasDetailsFold,
++  toolVisCollapseEnabled,
++  buildCollapsedToolVis,
+   RICH_MESSAGE_MAX_CHARS,
+ } from './telegram-rich-message.js';
+ 
+@@ -69,6 +75,34 @@
+   it('does NOT latch off on a per-message parser/400 error', () => {
+     expect(isRichCapabilityError({ errorCode: 400, message: 'Bad Request: can\'t parse rich_message' })).toBe(false);
+   });
++  it('does NOT latch off on per-message "not found" errors (the launch bug)', () => {
++    // Our own error text contains "RichMessage" — must not be misread as a
++    // capability error just because the message says "not found".
++    expect(isRichCapabilityError(new Error('editRichMessage failed: 400 Bad Request: chat not found'))).toBe(false);
++    expect(
++      isRichCapabilityError(new Error('editRichMessage failed: 400 Bad Request: message to edit not found')),
++    ).toBe(false);
++    expect(isRichCapabilityError(new Error('sendRichMessage failed: 400 Bad Request: chat not found'))).toBe(false);
++  });
++});
++
++describe('decodeRichEditTarget', () => {
++  it('decodes the adapter composite <chatId>:<messageId> form', () => {
++    expect(decodeRichEditTarget('7754134287:21037', 'telegram:7754134287')).toEqual({
++      chatId: 7754134287,
++      messageId: 21037,
++    });
++    expect(decodeRichEditTarget('-1001234567890:567', 'telegram:-1001234567890')).toEqual({
++      chatId: -1001234567890,
++      messageId: 567,
++    });
++  });
++  it('falls back to the thread id chat when the message id is bare', () => {
++    expect(decodeRichEditTarget('21037', 'telegram:7754134287')).toEqual({
++      chatId: 7754134287,
++      messageId: 21037,
++    });
++  });
+ });
+ 
+ describe('sendRichMessageRaw', () => {
+@@ -102,3 +136,109 @@
+     expect(RICH_MESSAGE_MAX_CHARS).toBe(32768);
+   });
+ });
++
++// ── PATCH 17 ────────────────────────────────────────────────────────────────
++
++describe('editRichMessageRaw', () => {
++  it('POSTs editMessageText with a rich_message payload', async () => {
++    const fetchImpl = vi.fn(async () => ({
++      json: async () => ({ ok: true, result: { message_id: 77 } }),
++    })) as unknown as typeof fetch;
++
++    const md = '<details><summary>🔧 2 Tool-Calls — aufklappen</summary>\n\n- a\n- b\n\n</details>';
++    const out = await editRichMessageRaw({ token: 'T', fetchImpl }, '-100123', '77', md);
++
++    expect(out).toEqual({ id: '77', raw: { message_id: 77 }, threadId: '-100123' });
++    const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
++    expect(url).toContain('/botT/editMessageText');
++    const body = JSON.parse((init as { body: string }).body);
++    expect(body.chat_id).toBe(-100123);
++    expect(body.message_id).toBe(77);
++    expect(body.rich_message).toEqual({ markdown: md });
++  });
++
++  it('decodes a composite <chatId>:<messageId> id into chat_id + message_id', async () => {
++    const fetchImpl = vi.fn(async () => ({
++      json: async () => ({ ok: true, result: { message_id: 21037 } }),
++    })) as unknown as typeof fetch;
++    await editRichMessageRaw({ token: 'T', fetchImpl }, 'telegram:7754134287', '7754134287:21037', '<details></details>');
++    const [, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
++    const body = JSON.parse((init as { body: string }).body);
++    expect(body.chat_id).toBe(7754134287);
++    expect(body.message_id).toBe(21037);
++  });
++
++  it('keeps the original message_id when result is the boolean true', async () => {
++    const fetchImpl = vi.fn(async () => ({
++      json: async () => ({ ok: true, result: true }),
++    })) as unknown as typeof fetch;
++    const out = await editRichMessageRaw({ token: 'T', fetchImpl }, '123', '55', '<details></details>');
++    expect(out.id).toBe('55');
++  });
++
++  it('throws (caller falls back) on ok:false, tagging the error code', async () => {
++    const fetchImpl = vi.fn(async () => ({
++      json: async () => ({ ok: false, error_code: 404, description: 'Not Found' }),
++    })) as unknown as typeof fetch;
++    await expect(
++      editRichMessageRaw({ token: 'T', fetchImpl }, '1', '2', '<details></details>'),
++    ).rejects.toMatchObject({ errorCode: 404 });
++  });
++});
++
++describe('chatIdFromTid', () => {
++  it('strips the bridge `telegram:` prefix to a numeric chat_id', () => {
++    expect(chatIdFromTid('telegram:7754134287')).toBe(7754134287);
++    expect(chatIdFromTid('telegram:-1001234567890')).toBe(-1001234567890);
++  });
++  it('accepts a bare numeric id (no prefix)', () => {
++    expect(chatIdFromTid('7754134287')).toBe(7754134287);
++    expect(chatIdFromTid('-100123')).toBe(-100123);
++  });
++  it('leaves a non-numeric id as a string', () => {
++    expect(chatIdFromTid('telegram:@channelname')).toBe('@channelname');
++  });
++});
++
++describe('hasDetailsFold', () => {
++  it('detects a <details> fold and ignores anything else', () => {
++    expect(hasDetailsFold('<details><summary>x</summary>y</details>')).toBe(true);
++    expect(hasDetailsFold('<DETAILS>')).toBe(true);
++    expect(hasDetailsFold('just text')).toBe(false);
++    expect(hasDetailsFold(TABLE)).toBe(false);
++  });
++});
++
++describe('toolVisCollapseEnabled', () => {
++  it('defaults ON when unset', () => {
++    expect(toolVisCollapseEnabled({})).toBe(true);
++    expect(toolVisCollapseEnabled({ TELEGRAM_TOOLVIS_COLLAPSE: 'true' })).toBe(true);
++  });
++  it('is OFF for explicit falsey values', () => {
++    for (const v of ['false', '0', 'off', 'no', 'FALSE']) {
++      expect(toolVisCollapseEnabled({ TELEGRAM_TOOLVIS_COLLAPSE: v })).toBe(false);
++    }
++  });
++});
++
++describe('buildCollapsedToolVis', () => {
++  it('wraps lines in a <details> fold with a counted, singular/plural summary', () => {
++    const one = buildCollapsedToolVis(['🔧 ssh check']);
++    expect(one).toContain('<details><summary>🔧 1 Tool-Call — aufklappen</summary>');
++    expect(one).toContain('🔧 ssh check');
++    expect(one.endsWith('</details>')).toBe(true);
++
++    const many = buildCollapsedToolVis(['🔧 a', '🔧 b', '🔧 c']);
++    expect(many).toContain('🔧 3 Tool-Calls — aufklappen');
++  });
++
++  it('drops blank lines from the count and body', () => {
++    const out = buildCollapsedToolVis(['🔧 a', '   ', '', '🔧 b']);
++    expect(out).toContain('2 Tool-Calls');
++  });
++
++  it('returns empty string for no usable lines (caller skips the collapse)', () => {
++    expect(buildCollapsedToolVis([])).toBe('');
++    expect(buildCollapsedToolVis(['', '  '])).toBe('');
++  });
++});
+--- chat-sdk-bridge.test.ts.p17bak-20260627-221901	2026-06-27 20:19:01.774937697 +0000
++++ chat-sdk-bridge.test.ts	2026-06-27 20:19:03.125004701 +0000
+@@ -443,3 +443,84 @@
+     }
+   });
+ });
++
++describe('createChatSdkBridge.deliver — tool-vis collapse to <details> fold (PATCH 17)', () => {
++  // With collapseToolVis on, finalize edits the completed bubble into a single
++  // collapsed <details> fold (summary visible, per-call timeline one tap away)
++  // instead of leaving the expanded timeline. Default-off preserves PATCH 09.
++  function captureBoth() {
++    const post: Array<{ tid: string; m: { markdown?: string } }> = [];
++    const edit: Array<{ tid: string; mid: string; m: { markdown?: string } }> = [];
++    const postMessage = async (tid: string, m: AdapterPostableMessage): Promise<RawMessage<unknown>> => {
++      post.push({ tid, m: m as { markdown?: string } });
++      return { id: `m${post.length}`, threadId: tid, raw: {} };
++    };
++    const editMessage = async (tid: string, mid: string, m: AdapterPostableMessage): Promise<RawMessage<unknown>> => {
++      edit.push({ tid, mid, m: m as { markdown?: string } });
++      return { id: mid, threadId: tid, raw: {} };
++    };
++    return { post, edit, postMessage, editMessage };
++  }
++
++  it('collapses the bubble into a <details> fold when the answer arrives', async () => {
++    vi.useFakeTimers();
++    try {
++      const { post, edit, postMessage, editMessage } = captureBoth();
++      const bridge = createChatSdkBridge({
++        adapter: stubAdapter({ postMessage, editMessage }),
++        supportsThreads: false,
++        maxTextLength: 4000,
++        collapseToolVis: true,
++      });
++      const tid = 'telegram:171';
++      const send = async (content: Record<string, unknown>) => {
++        const p = bridge.deliver(tid, null, { kind: 'chat-sdk', content });
++        await vi.advanceTimersByTimeAsync(250);
++        return p;
++      };
++
++      await send({ text: '🔧 step A', _toolVis: true }); // fresh bubble
++      await send({ text: '🔧 step B', _toolVis: true }); // coalesced
++      await send({ text: 'the answer' }); // finalize → collapse
++
++      // Exactly one edit: the collapse fold (not an expanded flush).
++      expect(edit).toHaveLength(1);
++      const folded = edit[0].m.markdown ?? '';
++      expect(folded).toContain('<details>');
++      expect(folded).toContain('🔧 2 Tool-Calls — aufklappen');
++      expect(folded).toContain('step A');
++      expect(folded).toContain('step B');
++      expect(folded.trimEnd().endsWith('</details>')).toBe(true);
++      // Answer still posts as a fresh, notifying message below the fold.
++      expect(post).toHaveLength(2);
++      expect(post[1].m.markdown).toContain('the answer');
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it('default-off: leaves the expanded timeline (PATCH 09 behaviour preserved)', async () => {
++    vi.useFakeTimers();
++    try {
++      const { edit, postMessage, editMessage } = captureBoth();
++      const bridge = createChatSdkBridge({
++        adapter: stubAdapter({ postMessage, editMessage }),
++        supportsThreads: false,
++        maxTextLength: 4000,
++      });
++      const tid = 'telegram:172';
++      const send = async (content: Record<string, unknown>) => {
++        const p = bridge.deliver(tid, null, { kind: 'chat-sdk', content });
++        await vi.advanceTimersByTimeAsync(250);
++        return p;
++      };
++      await send({ text: '🔧 step A', _toolVis: true });
++      await send({ text: '🔧 step B', _toolVis: true });
++      await send({ text: 'the answer' });
++      expect(edit).toHaveLength(1);
++      expect(edit[0].m.markdown ?? '').not.toContain('<details>');
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++});

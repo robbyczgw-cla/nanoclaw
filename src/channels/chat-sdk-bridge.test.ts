@@ -443,3 +443,84 @@ describe('createChatSdkBridge.deliver — tool-vis edit coalescing (PATCH 09)', 
     }
   });
 });
+
+describe('createChatSdkBridge.deliver — tool-vis collapse to <details> fold (PATCH 17)', () => {
+  // With collapseToolVis on, finalize edits the completed bubble into a single
+  // collapsed <details> fold (summary visible, per-call timeline one tap away)
+  // instead of leaving the expanded timeline. Default-off preserves PATCH 09.
+  function captureBoth() {
+    const post: Array<{ tid: string; m: { markdown?: string } }> = [];
+    const edit: Array<{ tid: string; mid: string; m: { markdown?: string } }> = [];
+    const postMessage = async (tid: string, m: AdapterPostableMessage): Promise<RawMessage<unknown>> => {
+      post.push({ tid, m: m as { markdown?: string } });
+      return { id: `m${post.length}`, threadId: tid, raw: {} };
+    };
+    const editMessage = async (tid: string, mid: string, m: AdapterPostableMessage): Promise<RawMessage<unknown>> => {
+      edit.push({ tid, mid, m: m as { markdown?: string } });
+      return { id: mid, threadId: tid, raw: {} };
+    };
+    return { post, edit, postMessage, editMessage };
+  }
+
+  it('collapses the bubble into a <details> fold when the answer arrives', async () => {
+    vi.useFakeTimers();
+    try {
+      const { post, edit, postMessage, editMessage } = captureBoth();
+      const bridge = createChatSdkBridge({
+        adapter: stubAdapter({ postMessage, editMessage }),
+        supportsThreads: false,
+        maxTextLength: 4000,
+        collapseToolVis: true,
+      });
+      const tid = 'telegram:171';
+      const send = async (content: Record<string, unknown>) => {
+        const p = bridge.deliver(tid, null, { kind: 'chat-sdk', content });
+        await vi.advanceTimersByTimeAsync(250);
+        return p;
+      };
+
+      await send({ text: '🔧 step A', _toolVis: true }); // fresh bubble
+      await send({ text: '🔧 step B', _toolVis: true }); // coalesced
+      await send({ text: 'the answer' }); // finalize → collapse
+
+      // Exactly one edit: the collapse fold (not an expanded flush).
+      expect(edit).toHaveLength(1);
+      const folded = edit[0].m.markdown ?? '';
+      expect(folded).toContain('<details>');
+      expect(folded).toContain('🔧 2 Tool-Calls — aufklappen');
+      expect(folded).toContain('step A');
+      expect(folded).toContain('step B');
+      expect(folded.trimEnd().endsWith('</details>')).toBe(true);
+      // Answer still posts as a fresh, notifying message below the fold.
+      expect(post).toHaveLength(2);
+      expect(post[1].m.markdown).toContain('the answer');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('default-off: leaves the expanded timeline (PATCH 09 behaviour preserved)', async () => {
+    vi.useFakeTimers();
+    try {
+      const { edit, postMessage, editMessage } = captureBoth();
+      const bridge = createChatSdkBridge({
+        adapter: stubAdapter({ postMessage, editMessage }),
+        supportsThreads: false,
+        maxTextLength: 4000,
+      });
+      const tid = 'telegram:172';
+      const send = async (content: Record<string, unknown>) => {
+        const p = bridge.deliver(tid, null, { kind: 'chat-sdk', content });
+        await vi.advanceTimersByTimeAsync(250);
+        return p;
+      };
+      await send({ text: '🔧 step A', _toolVis: true });
+      await send({ text: '🔧 step B', _toolVis: true });
+      await send({ text: 'the answer' });
+      expect(edit).toHaveLength(1);
+      expect(edit[0].m.markdown ?? '').not.toContain('<details>');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

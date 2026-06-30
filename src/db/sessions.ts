@@ -63,6 +63,20 @@ export function getSessionsByAgentGroup(agentGroupId: string): Session[] {
   return getDb().prepare('SELECT * FROM sessions WHERE agent_group_id = ?').all(agentGroupId) as Session[];
 }
 
+/** All sessions tied to a (messaging group, thread) pair — used by nanoclaw-webchat
+ * thread cleanup (getSessionsForMessagingGroupThread). Mirrors findSession's null
+ * handling but returns ALL matching sessions (any status), for deletion. */
+export function getSessionsForMessagingGroupThread(messagingGroupId: string, threadId: string | null): Session[] {
+  if (threadId) {
+    return getDb()
+      .prepare('SELECT * FROM sessions WHERE messaging_group_id = ? AND thread_id = ?')
+      .all(messagingGroupId, threadId) as Session[];
+  }
+  return getDb()
+    .prepare('SELECT * FROM sessions WHERE messaging_group_id = ? AND thread_id IS NULL')
+    .all(messagingGroupId) as Session[];
+}
+
 export function getActiveSessions(): Session[] {
   return getDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
 }

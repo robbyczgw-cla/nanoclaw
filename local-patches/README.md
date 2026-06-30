@@ -25,6 +25,9 @@ This directory tracks every local source-code modification applied to `/root/nan
 | 13 | `container/agent-runner/src/message-blocks.ts` | Tolerant parse tail-strip (no mid-body cut on a quoted `</parameter>`/`</invoke>`) | none (local-only) | 🟢 local-only |
 | 14 | `container/skills/learn/SKILL.md` | `/learn` as a runtime skill in agent containers (copied from `.claude/skills/`, which isn't mounted into containers) | none (upstream ships it only at dev level) | 🟢 local-only |
 | 15 | `container/agent-runner/src/providers/claude.ts` | Local default model (`claude-opus-4-8`, was stale `claude-opus-4-7[1m]`) + auto-compact window (`900000`, upstream `165000`) | none (upstream has neither) | 🟢 local-only |
+| 16 | `src/channels/telegram-rich-message.ts` (new) + `telegram.ts` | Native Telegram tables via Bot API 10.1 `sendRichMessage` (table-primary auto-route, MarkdownV2 fallback) | candidate (generic) | 🟢 local-only |
+| 17 | `src/channels/{telegram-rich-message,telegram,chat-sdk-bridge}.ts` | Collapse tool-vis timeline into a `<details>` fold on turn-end (`editMessageText`+`rich_message`) | none (rides on local PATCH 09) | 🟢 local-only |
+| 18 | `src/channels/telegram-rich-message.ts` + `telegram.ts` | Broaden rich routing to MarkdownV2-impossible constructs (headings, `<details>`, dividers, block math, task lists) + TDesktop crash-guard | candidate (generic) | 🟢 local-only |
 
 **Apply order matters:** 02 must be applied before 03 — 03's apply-script anchors on strings introduced by 02. Patch 01 is independent of 02/03.
 

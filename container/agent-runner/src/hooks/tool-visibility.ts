@@ -88,6 +88,7 @@ const TOOL_EMOJI: Record<string, string> = {
   Agent: '🤖',
   Task: '🤖',
   TodoWrite: '📝',
+  Skill: '📚',
 };
 
 const TOOL_LABEL: Record<string, string> = {
@@ -101,6 +102,7 @@ const TOOL_LABEL: Record<string, string> = {
   Agent: 'agent',
   Task: 'task',
   TodoWrite: 'todo',
+  Skill: 'skill',
 };
 
 const BATCH_TOOLS = new Set(['Read', 'Write', 'Edit', 'MultiEdit', 'WebFetch']);
@@ -310,6 +312,9 @@ function describeToolInput(toolName: string, toolInput: unknown): string {
   if (toolName === 'TodoWrite' && Array.isArray(input.todos)) {
     const n = input.todos.length;
     return `${n} task${n === 1 ? '' : 's'}`;
+  }
+  if (toolName === 'Skill' && typeof input.skill === 'string') {
+    return `\`${input.skill}\``;
   }
 
   for (const val of Object.values(input)) {
