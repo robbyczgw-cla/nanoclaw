@@ -170,6 +170,14 @@ else
   ALL_OK=false
 fi
 
+# Patch 20 — selectively eager-load core reply tools (send_message etc.)
+if [ "$(grep -c "anthropic/alwaysLoad" container/agent-runner/src/mcp-tools/core.ts 2>/dev/null)" = "4" ]; then
+  echo "✅ 20-eager-core-reply-tools applied"
+else
+  echo "❌ 20-eager-core-reply-tools MISSING (or partial — expected 4 occurrences of anthropic/alwaysLoad)"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

@@ -107,6 +107,8 @@ export const sendMessage: McpToolDefinition = {
       },
       required: ['text'],
     },
+    // Needed on every turn to reply — never defer behind ToolSearch (PATCH 20).
+    _meta: { 'anthropic/alwaysLoad': true },
   },
   async handler(args) {
     const text = args.text as string;
@@ -145,6 +147,8 @@ export const sendFile: McpToolDefinition = {
       },
       required: ['path'],
     },
+    // Core reply tool — eager-loaded alongside send_message (PATCH 20).
+    _meta: { 'anthropic/alwaysLoad': true },
   },
   async handler(args) {
     const filePath = args.path as string;
@@ -190,6 +194,8 @@ export const editMessage: McpToolDefinition = {
       },
       required: ['messageId', 'text'],
     },
+    // Core reply tool — eager-loaded alongside send_message (PATCH 20).
+    _meta: { 'anthropic/alwaysLoad': true },
   },
   async handler(args) {
     const seq = Number(args.messageId);
@@ -231,6 +237,8 @@ export const addReaction: McpToolDefinition = {
       },
       required: ['messageId', 'emoji'],
     },
+    // Core reply tool — eager-loaded alongside send_message (PATCH 20).
+    _meta: { 'anthropic/alwaysLoad': true },
   },
   async handler(args) {
     const seq = Number(args.messageId);

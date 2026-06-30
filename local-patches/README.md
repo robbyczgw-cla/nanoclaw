@@ -28,6 +28,7 @@ This directory tracks every local source-code modification applied to `/root/nan
 | 16 | `src/channels/telegram-rich-message.ts` (new) + `telegram.ts` | Native Telegram tables via Bot API 10.1 `sendRichMessage` (table-primary auto-route, MarkdownV2 fallback) | candidate (generic) | 🟢 local-only |
 | 17 | `src/channels/{telegram-rich-message,telegram,chat-sdk-bridge}.ts` | Collapse tool-vis timeline into a `<details>` fold on turn-end (`editMessageText`+`rich_message`) | none (rides on local PATCH 09) | 🟢 local-only |
 | 18 | `src/channels/telegram-rich-message.ts` + `telegram.ts` | Broaden rich routing to MarkdownV2-impossible constructs (headings, `<details>`, dividers, block math, task lists) + TDesktop crash-guard | candidate (generic) | 🟢 local-only |
+| 20 | `container/agent-runner/src/mcp-tools/core.ts` | Selectively eager-load core reply tools (`send_message`/`send_file`/`edit_message`/`add_reaction` via `_meta['anthropic/alwaysLoad']`) so Sonnet-5 doesn't loop on `ToolSearch` for `send_message` | candidate (generic) | 🟢 local-only |
 
 **Apply order matters:** 02 must be applied before 03 — 03's apply-script anchors on strings introduced by 02. Patch 01 is independent of 02/03.
 
