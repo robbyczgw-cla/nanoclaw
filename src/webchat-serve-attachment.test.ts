@@ -4,7 +4,12 @@ import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { mimeTypeFromFilename, parseAttachmentByteRange, serveAttachmentFile, inferAttachmentMime } from './webchat-serve-attachment.js';
+import {
+  mimeTypeFromFilename,
+  parseAttachmentByteRange,
+  serveAttachmentFile,
+  inferAttachmentMime,
+} from './webchat-serve-attachment.js';
 
 function requestFile(
   filePath: string,

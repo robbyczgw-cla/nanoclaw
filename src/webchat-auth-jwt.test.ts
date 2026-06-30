@@ -14,11 +14,7 @@ function base64UrlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString('base64url');
 }
 
-function signRs256Jwt(
-  payload: Record<string, unknown>,
-  privateKey: crypto.KeyObject,
-  kid = 'test-key',
-): string {
+function signRs256Jwt(payload: Record<string, unknown>, privateKey: crypto.KeyObject, kid = 'test-key'): string {
   const header = { alg: 'RS256', typ: 'JWT', kid };
   const encodedHeader = base64UrlJson(header);
   const encodedPayload = base64UrlJson(payload);
@@ -32,11 +28,7 @@ function rsaJwkFromPublicKey(publicKey: crypto.KeyObject, kid: string): JsonWebK
   return { ...jwk, kid, use: 'sig', alg: 'RS256' };
 }
 
-function signEs256Jwt(
-  payload: Record<string, unknown>,
-  privateKey: crypto.KeyObject,
-  kid = 'ec-key',
-): string {
+function signEs256Jwt(payload: Record<string, unknown>, privateKey: crypto.KeyObject, kid = 'ec-key'): string {
   const header = { alg: 'ES256', typ: 'JWT', kid };
   const encodedHeader = base64UrlJson(header);
   const encodedPayload = base64UrlJson(payload);

@@ -61,10 +61,7 @@ export type ParsedAttachmentByteRange =
   | null;
 
 /** Parse RFC 7233 `bytes=` ranges (prefix, open-ended, and suffix forms). */
-export function parseAttachmentByteRange(
-  rangeHeader: string,
-  fileSize: number,
-): ParsedAttachmentByteRange {
+export function parseAttachmentByteRange(rangeHeader: string, fileSize: number): ParsedAttachmentByteRange {
   const trimmed = rangeHeader.trim();
 
   const suffixMatch = /^bytes=-(\d+)$/.exec(trimmed);
@@ -84,13 +81,7 @@ export function parseAttachmentByteRange(
 
   const start = Number.parseInt(match[1]!, 10);
   const end = match[2] ? Number.parseInt(match[2], 10) : fileSize - 1;
-  if (
-    Number.isNaN(start) ||
-    Number.isNaN(end) ||
-    start < 0 ||
-    end < start ||
-    start >= fileSize
-  ) {
+  if (Number.isNaN(start) || Number.isNaN(end) || start < 0 || end < start || start >= fileSize) {
     return { ok: false, reason: 'invalid' };
   }
 

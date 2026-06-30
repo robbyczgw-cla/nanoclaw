@@ -193,9 +193,7 @@ export function loadWebAdapterAuthConfig(): WebAdapterAuthConfig | null {
     throw new Error('WEBCHAT_SESSION_SECRET is required when WEBCHAT_AUTH_MODE=public');
   }
   if (sessionSecret.length < MIN_SESSION_SECRET_LENGTH) {
-    throw new Error(
-      `WEBCHAT_SESSION_SECRET must be at least ${MIN_SESSION_SECRET_LENGTH} characters`,
-    );
+    throw new Error(`WEBCHAT_SESSION_SECRET must be at least ${MIN_SESSION_SECRET_LENGTH} characters`);
   }
 
   const oidcEnabled = env('WEBCHAT_AUTH_OIDC_ENABLED', file) === 'true';
@@ -215,9 +213,7 @@ export function loadWebAdapterAuthConfig(): WebAdapterAuthConfig | null {
   }
 
   const basicPassword = env('WEBCHAT_BASIC_PASSWORD', file) ?? '';
-  const allowedUsernames = parseCsv(env('WEBCHAT_BASIC_ALLOWED_USERNAMES', file)).map((u) =>
-    u.toLowerCase(),
-  );
+  const allowedUsernames = parseCsv(env('WEBCHAT_BASIC_ALLOWED_USERNAMES', file)).map((u) => u.toLowerCase());
   if (basicEnabled) {
     if (!basicPassword) throw new Error('WEBCHAT_BASIC_PASSWORD is required when basic auth is enabled');
     if (allowedUsernames.length === 0) {

@@ -28,11 +28,7 @@ function base64UrlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString('base64url');
 }
 
-function signRs256Jwt(
-  payload: Record<string, unknown>,
-  privateKey: crypto.KeyObject,
-  kid = 'test-key',
-): string {
+function signRs256Jwt(payload: Record<string, unknown>, privateKey: crypto.KeyObject, kid = 'test-key'): string {
   const header = { alg: 'RS256', typ: 'JWT', kid };
   const encodedHeader = base64UrlJson(header);
   const encodedPayload = base64UrlJson(payload);
@@ -165,10 +161,7 @@ describe('webchat-auth', () => {
   });
 
   it('creates and validates signed session cookies', () => {
-    const record = createSession(
-      { userId: 'web:basic:alice', displayName: 'Alice', authMethod: 'basic' },
-      3600,
-    );
+    const record = createSession({ userId: 'web:basic:alice', displayName: 'Alice', authMethod: 'basic' }, 3600);
     const signed = signSessionCookie(record.id, 'session-secret');
     const parsed = parseSessionCookie(signed, 'session-secret');
     expect(parsed).toBe(record.id);

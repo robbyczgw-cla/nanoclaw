@@ -102,11 +102,7 @@ function validateIdTokenClaims(payload: Record<string, unknown>, options: IdToke
 }
 
 /** Verify RS256 or ES256 JWT signature and standard OIDC id_token claims. */
-export function verifyIdToken(
-  jwt: string,
-  keys: JsonWebKey[],
-  options: IdTokenVerifyOptions,
-): Record<string, unknown> {
+export function verifyIdToken(jwt: string, keys: JsonWebKey[], options: IdTokenVerifyOptions): Record<string, unknown> {
   const parts = jwt.split('.');
   if (parts.length !== 3) throw new Error('Invalid JWT');
 
@@ -139,7 +135,6 @@ export function verifyRs256IdToken(
 /** Whether a verification failure may succeed after refreshing JWKS (key rotation). */
 export function isJwksRetryableVerificationError(err: unknown): boolean {
   return (
-    err instanceof Error &&
-    (err.message === 'Invalid JWT signature' || err.message === 'No matching JWK for id_token')
+    err instanceof Error && (err.message === 'Invalid JWT signature' || err.message === 'No matching JWK for id_token')
   );
 }

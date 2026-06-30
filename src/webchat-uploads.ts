@@ -186,38 +186,41 @@ export async function parseMultipartUpload(
       resolve(value);
     };
 
-    busboy.on('file', (_field: string, stream: NodeJS.ReadableStream, info: { filename?: string; mimeType?: string }) => {
-      fs.mkdirSync(uploadDir, { recursive: true });
-      partialPath = finalPath;
-      fileMeta = {
-        name: info.filename || 'upload',
-        mimeType: inferAttachmentMime(info.filename || 'upload', info.mimeType || ''),
-      };
-      const ws = fs.createWriteStream(finalPath);
-      fileWriteStream = ws;
-      fileWriteDone = new Promise<void>((resolveWrite) => {
-        pipelineCallback(stream, ws, (err) => {
-          if (err && !limitHit) writeError = true;
-          resolveWrite();
+    busboy.on(
+      'file',
+      (_field: string, stream: NodeJS.ReadableStream, info: { filename?: string; mimeType?: string }) => {
+        fs.mkdirSync(uploadDir, { recursive: true });
+        partialPath = finalPath;
+        fileMeta = {
+          name: info.filename || 'upload',
+          mimeType: inferAttachmentMime(info.filename || 'upload', info.mimeType || ''),
+        };
+        const ws = fs.createWriteStream(finalPath);
+        fileWriteStream = ws;
+        fileWriteDone = new Promise<void>((resolveWrite) => {
+          pipelineCallback(stream, ws, (err) => {
+            if (err && !limitHit) writeError = true;
+            resolveWrite();
+          });
         });
-      });
 
-      stream.on('error', () => {
-        writeError = true;
-        ws.destroy();
-      });
+        stream.on('error', () => {
+          writeError = true;
+          ws.destroy();
+        });
 
-      stream.on('limit', () => {
-        limitHit = true;
-        ws.destroy();
-        cleanupPartial();
-        try {
-          fs.rmSync(uploadDir, { recursive: true, force: true });
-        } catch {
-          // ignore
-        }
-      });
-    });
+        stream.on('limit', () => {
+          limitHit = true;
+          ws.destroy();
+          cleanupPartial();
+          try {
+            fs.rmSync(uploadDir, { recursive: true, force: true });
+          } catch {
+            // ignore
+          }
+        });
+      },
+    );
 
     busboy.on('finish', () => {
       void (async () => {
@@ -305,9 +308,7 @@ export type AcceptChunkResult =
   | { ok: true; upload?: StagedUpload; received: number; total: number }
   | { ok: false; error: string; status: number };
 
-export function isAcceptChunkOk(
-  result: AcceptChunkResult,
-): result is Extract<AcceptChunkResult, { ok: true }> {
+export function isAcceptChunkOk(result: AcceptChunkResult): result is Extract<AcceptChunkResult, { ok: true }> {
   return result.ok;
 }
 

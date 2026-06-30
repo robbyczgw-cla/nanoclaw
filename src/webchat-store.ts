@@ -350,8 +350,7 @@ export function appendMessageWithAttachmentMeta(
     db.close();
   }
 
-  const apiAttachments =
-    storedAttachments.length > 0 ? storedToApiAttachments(msg.id, storedAttachments) : undefined;
+  const apiAttachments = storedAttachments.length > 0 ? storedToApiAttachments(msg.id, storedAttachments) : undefined;
 
   return {
     ...msg,

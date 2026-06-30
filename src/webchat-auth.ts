@@ -286,10 +286,7 @@ export function buildAuthConfigResponse(config: PublicAuthConfig): AuthConfigRes
   };
 }
 
-export function resolveSessionUser(
-  config: PublicAuthConfig,
-  req: http.IncomingMessage,
-): ResolvedWebUser | null {
+export function resolveSessionUser(config: PublicAuthConfig, req: http.IncomingMessage): ResolvedWebUser | null {
   const raw = parseCookieHeader(req.headers.cookie, WEBCHAT_SESSION_COOKIE);
   const sessionId = parseSessionCookie(raw, config.sessionSecret);
   if (!sessionId) return null;
@@ -314,9 +311,7 @@ function redirect(res: http.ServerResponse, location: string): void {
 
 function htmlPage(res: http.ServerResponse, status: number, title: string, body: string): void {
   res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(
-    `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}</body></html>`,
-  );
+  res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}</body></html>`);
 }
 
 async function startOidcLogin(

@@ -77,7 +77,9 @@ describe('webchat-uploads', () => {
   it('parses multipart uploads to staging', async () => {
     const boundary = '----TestBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n`,
+      ),
       Buffer.from('hello'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -115,7 +117,9 @@ describe('webchat-uploads', () => {
   it('infers mp3 mime types from filename on multipart upload', async () => {
     const boundary = '----TestBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="song.mp3"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="song.mp3"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      ),
       Buffer.from('fake-mp3'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -154,11 +158,13 @@ describe('webchat-uploads', () => {
   });
 
   it('rejects invalid chunk requests', async () => {
-    expect(await acceptChunk(
-      { uploadId: 'not-a-uuid', chunkIndex: 0, totalChunks: 1, filename: 'a.txt', data: 'YQ==' },
-      'lobby',
-      'main',
-    )).toMatchObject({ error: 'Invalid uploadId format', status: 400 });
+    expect(
+      await acceptChunk(
+        { uploadId: 'not-a-uuid', chunkIndex: 0, totalChunks: 1, filename: 'a.txt', data: 'YQ==' },
+        'lobby',
+        'main',
+      ),
+    ).toMatchObject({ error: 'Invalid uploadId format', status: 400 });
 
     const uploadId = '550e8400-e29b-41d4-a716-446655440000';
     await acceptChunk(
@@ -166,11 +172,13 @@ describe('webchat-uploads', () => {
       'lobby',
       'main',
     );
-    expect(await acceptChunk(
-      { uploadId, chunkIndex: 1, totalChunks: 3, filename: 'a.txt', mimeType: 'text/plain', data: 'Yg==' },
-      'lobby',
-      'main',
-    )).toMatchObject({ error: 'totalChunks mismatch', status: 400 });
+    expect(
+      await acceptChunk(
+        { uploadId, chunkIndex: 1, totalChunks: 3, filename: 'a.txt', mimeType: 'text/plain', data: 'Yg==' },
+        'lobby',
+        'main',
+      ),
+    ).toMatchObject({ error: 'totalChunks mismatch', status: 400 });
   });
 
   it('returns partial progress for multi-chunk uploads', async () => {
@@ -240,11 +248,13 @@ describe('webchat-uploads', () => {
   });
 
   it('rejects chunk uploads with missing fields', async () => {
-    expect(await acceptChunk(
-      { uploadId: '550e8400-e29b-41d4-a716-446655440000', chunkIndex: 0, totalChunks: 1, filename: '', data: '' },
-      'lobby',
-      'main',
-    )).toMatchObject({ status: 400 });
+    expect(
+      await acceptChunk(
+        { uploadId: '550e8400-e29b-41d4-a716-446655440000', chunkIndex: 0, totalChunks: 1, filename: '', data: '' },
+        'lobby',
+        'main',
+      ),
+    ).toMatchObject({ status: 400 });
   });
 
   it('rejects non-multipart uploads', async () => {
@@ -293,7 +303,9 @@ describe('webchat-uploads', () => {
     const mod = await import('./webchat-uploads.js');
     const boundary = '----LimitBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="big.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="big.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      ),
       Buffer.from('123456789'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -390,7 +402,9 @@ describe('webchat-uploads', () => {
   it('returns 500 when multipart write fails without hitting size limit', async () => {
     const boundary = '----WriteFailBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="fail.txt"\r\nContent-Type: text/plain\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="fail.txt"\r\nContent-Type: text/plain\r\n\r\n`,
+      ),
       Buffer.from('hello'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -517,7 +531,9 @@ describe('webchat-uploads', () => {
   it('rejects multipart uploads when the staged file is not a regular file', async () => {
     const boundary = '----RegularFileBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n`,
+      ),
       Buffer.from('hello'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
