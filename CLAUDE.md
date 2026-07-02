@@ -329,4 +329,4 @@ bash /root/nanoclaw-v2/local-patches/verify.sh
 
 If any patch shows ❌, follow the re-apply workflow in `local-patches/README.md`.
 
-**Currently active patches:** 3 (telegram maxTextLength, tool-visibility v0.x polish, tool-visibility v0.y failure-detection). See the README for upstream-PR status and per-patch reasoning.
+**Currently active patches:** 20 (01–18, 20, 21 — Telegram rendering/limits, tool-visibility pipeline, message-delivery robustness 11/12/13/21, eager core reply tools 20, u.a.). `local-patches/README.md` is the authoritative list with upstream-PR status and per-patch reasoning.
