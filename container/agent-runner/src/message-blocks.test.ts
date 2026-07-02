@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 
-import { parseMessageBlocks, countMessageBlockOpenTags, buildRewrapReminder } from './message-blocks';
+import { parseMessageBlocks, countMessageBlockOpenTags, buildRewrapReminder, salvageUnwrappedReply } from './message-blocks';
 
 describe('parseMessageBlocks — tolerant closing tag (PATCH 12, turn-stall fix)', () => {
   it('REGRESSION: a block closed with </parameter> instead of </message> is parsed (not discarded)', () => {
@@ -105,5 +105,30 @@ describe('buildRewrapReminder — specific feedback (PATCH 12)', () => {
     const r = buildRewrapReminder(['a', 'b'], ['Robby']);
     expect(r).toContain('"a", "b"');
     expect(r).toContain('are not valid');
+  });
+});
+
+describe('salvageUnwrappedReply (PATCH 21)', () => {
+  it('returns bare reply text unchanged (trimmed)', () => {
+    expect(salvageUnwrappedReply('  Hier die Antwort.  ')).toBe('Hier die Antwort.');
+  });
+
+  it('strips attribute-less / unclosed <message> tag remnants', () => {
+    expect(salvageUnwrappedReply('<message>Antwort ohne to')).toBe('Antwort ohne to');
+    expect(salvageUnwrappedReply('<message to="x">Antwort unclosed')).toBe('Antwort unclosed');
+    expect(salvageUnwrappedReply('<message to="x">Antwort</message>')).toBe('Antwort');
+  });
+
+  it('strips a stray trailing </parameter> / </invoke> but keeps mid-body mentions', () => {
+    expect(salvageUnwrappedReply('Antwort</parameter>')).toBe('Antwort');
+    expect(salvageUnwrappedReply('Nutze `</parameter>` als Tag — so gehts.')).toBe(
+      'Nutze `</parameter>` als Tag — so gehts.',
+    );
+  });
+
+  it('returns null for empty / whitespace-only / tag-only input', () => {
+    expect(salvageUnwrappedReply('')).toBeNull();
+    expect(salvageUnwrappedReply('   \n ')).toBeNull();
+    expect(salvageUnwrappedReply('<message to="x"></message>')).toBeNull();
   });
 });

@@ -114,20 +114,24 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
-  it('bare text produces no outbound messages (scratchpad only)', async () => {
+  it('bare text is fallback-delivered to the triggering channel (PATCH 21)', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'hello' }, { platformId: 'chan-1', channelType: 'discord' });
 
-    // Agent responds with bare text — no <message to="..."> wrapping
+    // Agent responds with bare text — no <message to="..."> wrapping. Pre-21
+    // this was dropped as scratchpad (+ re-prompt nudge); the wrapper is
+    // usually never emitted at all, so the text is now delivered directly.
     const provider = new MockProvider({}, () => 'I am thinking about this...');
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    // Wait long enough for the poll loop to process
-    await sleep(1000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
     controller.abort();
 
     const out = getUndeliveredMessages();
-    expect(out).toHaveLength(0);
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('I am thinking about this...');
+    expect(out[0].platform_id).toBe('chan-1');
+    expect(out[0].channel_type).toBe('discord');
 
     await loopPromise.catch(() => {});
   });
@@ -364,8 +368,11 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
     let calls = 0;
     const provider = new HookedMockProvider({}, () => {
       calls += 1;
-      // First result is unwrapped (triggers the retry nudge), second is wrapped.
-      return calls === 1 ? 'unwrapped text' : '<message to="discord-test">wrapped now</message>';
+      // First result targets an UNKNOWN destination (the one case that still
+      // triggers the retry nudge post-PATCH 21), second is correctly wrapped.
+      return calls === 1
+        ? '<message to="no-such-dest">misrouted text</message>'
+        : '<message to="discord-test">wrapped now</message>';
     });
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);

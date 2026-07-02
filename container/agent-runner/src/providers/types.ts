@@ -131,7 +131,16 @@ export type ProviderEvent =
    * poll-loop uses it to surface the result text to the user instead of
    * dropping it as un-wrapped scratchpad, and to skip the re-wrap nudge.
    */
-  | { type: 'result'; text: string | null; isError?: boolean }
+  /**
+   * `lastText` (PATCH 21) is the FINAL main-agent text chunk of the turn (the
+   * last assistant text block, as opposed to `text` which accumulates every
+   * chunk). The poll-loop uses it to salvage an unwrapped reply: when the
+   * model forgets the <message to="..."> envelope entirely, the last chunk is
+   * the intended reply and gets delivered to the triggering channel directly.
+   * Optional — providers that emit a single final text can omit it (the loop
+   * falls back to `text`).
+   */
+  | { type: 'result'; text: string | null; isError?: boolean; lastText?: string | null }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**

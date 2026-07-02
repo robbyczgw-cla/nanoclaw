@@ -427,17 +427,117 @@ describe('error result with no <message> envelope', () => {
     expect(pushes).toHaveLength(0);
   });
 
-  it('still nudges (and does not deliver) a normal unwrapped result', async () => {
+  it('PATCH 21: a normal unwrapped result is now fallback-delivered, not nudged', async () => {
+    // Pre-21 behavior: re-prompt nudge, nothing delivered. Confirmed against
+    // raw API transcripts that the wrapper is never emitted in these turns —
+    // the nudge burned turns and often still failed, so the final text is
+    // delivered directly instead.
     const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare text, no envelope' });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('bare text, no envelope');
+    expect(pushes).toHaveLength(0);
+  });
+});
+
+describe('unwrapped-reply fallback delivery (PATCH 21)', () => {
+  it('REGRESSION: model omits the <message> wrapper on a long tool-chain turn — final chunk is delivered', async () => {
+    // Exact production failure shape (dm-with-robby, 2026-07-02): the turn
+    // accumulated several bare narration chunks, the FINAL chunk was the
+    // intended reply, and the whole turn contained ZERO <message> tags.
+    const accumulated =
+      'Go. 💪 Ich code den Slice jetzt — erst lese ich die Spec:\n' +
+      'Klarer Vertrag — genau was ich brauche.\n' +
+      'Fertig gebaut. Hier das Ergebnis: alles grün, 3 Tests bestanden.';
+    const lastText = 'Fertig gebaut. Hier das Ergebnis: alles grün, 3 Tests bestanden.';
+    const { query, pushes } = makeResultQuery({ type: 'result', text: accumulated, lastText });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    // Only the final chunk is delivered — not the accumulated narration.
+    expect(JSON.parse(out[0].content).text).toBe(lastText);
+    expect(out[0].platform_id).toBe('chan-1');
+    // No re-wrap nudge for a missing wrapper.
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('internal-only final chunk: nothing is delivered and nothing is nudged', async () => {
+    // The model explicitly ended on a no-reply note (e.g. reply already sent
+    // via the send_message MCP tool). Nudging here produced apology noise.
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: 'Turing-Test durch — Ergebnis lesen:\n🎯 Gate BESTANDEN',
+      lastText: '<internal>Already delivered via send_message (id 39175). Nothing further to send.</internal>',
+    });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('unclosed / attribute-less <message> tag: body is salvaged and delivered', async () => {
+    const lastText = '<message>Hier die eigentliche Antwort ohne to-Attribut';
+    const { query, pushes } = makeResultQuery({ type: 'result', text: lastText, lastText });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Hier die eigentliche Antwort ohne to-Attribut');
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('agent-to-agent channel: never fallback-delivered (self-loop guard)', async () => {
+    // A bare reply auto-delivered onto the A2A channel can bounce back as a
+    // new inbound to the same group and self-loop. Logged, not delivered.
+    const a2aRouting = { platformId: 'ag-self-1', channelType: 'agent', threadId: null, inReplyTo: 'm1' };
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: 'bare reply on the agent channel',
+      lastText: 'bare reply on the agent channel',
+    });
+
+    await processQuery(query, a2aRouting, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('unknown destination still gets the specific re-prompt (not fallback-delivered on first try)', async () => {
+    const text = '<message to="nope">Antwort an falschen Namen</message>';
+    const { query, pushes } = makeResultQuery({ type: 'result', text, lastText: text });
 
     await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
 
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
-    // PATCH 12 replaced the generic nudge with buildRewrapReminder ("...was
-    // NOT delivered. ..."), which is more specific. Match the concept
-    // case-insensitively rather than upstream's exact lowercase wording.
-    expect(pushes[0]).toMatch(/not delivered/i);
+    expect(pushes[0]).toMatch(/not valid/i);
+  });
+
+  it('wrapped block delivered normally → no fallback duplicate, trailing narration stays scratchpad', async () => {
+    // Guard against double-delivery: when a block WAS dispatched, the bare
+    // trailing text must not additionally be fallback-delivered.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('Robby', 'Robby', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+    const text = '<message to="Robby">echte Antwort</message>\nnoch etwas Notiz-Text';
+    const { query, pushes } = makeResultQuery({ type: 'result', text, lastText: text });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('echte Antwort');
+    expect(pushes).toHaveLength(0);
   });
 });
 

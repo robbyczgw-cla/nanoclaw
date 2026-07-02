@@ -448,6 +448,12 @@ export class ClaudeProvider implements AgentProvider {
       // before a trailing tool_use (common on long tool chains) would otherwise
       // be dropped. Reset on each result (turn boundary / follow-up push).
       let turnText = '';
+      // PATCH 21: also track the LAST non-empty main-agent text chunk. When
+      // the model omits the <message> wrapper entirely (confirmed against raw
+      // API transcripts — the wrapper is never emitted, not lost in code),
+      // this final chunk is the intended reply; the poll-loop delivers it as
+      // a fallback instead of dropping the turn.
+      let lastChunk: string | null = null;
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
@@ -460,7 +466,9 @@ export class ClaudeProvider implements AgentProvider {
         } else if (message.type === 'assistant') {
           // PATCH 11: capture main-agent text as it streams (sub-agent/Task
           // messages carry parent_tool_use_id and are excluded).
-          turnText = appendTurnText(turnText, extractMainAgentText(message as AssistantLikeMessage));
+          const chunk = extractMainAgentText(message as AssistantLikeMessage);
+          turnText = appendTurnText(turnText, chunk);
+          if (chunk.trim()) lastChunk = chunk; // PATCH 21
         } else if (message.type === 'result') {
           // MERGE (PATCH 11 + upstream error-surfacing): `result` text exists
           // only on subtype:"success"; error subtypes (e.g. a non-retryable 403
@@ -474,8 +482,10 @@ export class ClaudeProvider implements AgentProvider {
           // from the full accumulated turn text (a superset of result.result),
           // falling back to resultText if nothing was captured.
           const text = isError ? resultText : resolveTurnDispatchText(turnText, resultText);
+          const lastText = lastChunk ?? resultText; // PATCH 21
           turnText = '';
-          yield { type: 'result', text, isError };
+          lastChunk = null;
+          yield { type: 'result', text, isError, lastText };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {

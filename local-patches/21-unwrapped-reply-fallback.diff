@@ -1,0 +1,430 @@
+diff --git a/container/agent-runner/src/integration.test.ts b/container/agent-runner/src/integration.test.ts
+index 4d32fb8..b600fcb 100644
+--- a/container/agent-runner/src/integration.test.ts
++++ b/container/agent-runner/src/integration.test.ts
+@@ -114,20 +114,24 @@ describe('poll loop integration', () => {
+     await loopPromise.catch(() => {});
+   });
+ 
+-  it('bare text produces no outbound messages (scratchpad only)', async () => {
++  it('bare text is fallback-delivered to the triggering channel (PATCH 21)', async () => {
+     insertMessage('m1', { sender: 'Alice', text: 'hello' }, { platformId: 'chan-1', channelType: 'discord' });
+ 
+-    // Agent responds with bare text — no <message to="..."> wrapping
++    // Agent responds with bare text — no <message to="..."> wrapping. Pre-21
++    // this was dropped as scratchpad (+ re-prompt nudge); the wrapper is
++    // usually never emitted at all, so the text is now delivered directly.
+     const provider = new MockProvider({}, () => 'I am thinking about this...');
+     const controller = new AbortController();
+     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+ 
+-    // Wait long enough for the poll loop to process
+-    await sleep(1000);
++    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+     controller.abort();
+ 
+     const out = getUndeliveredMessages();
+-    expect(out).toHaveLength(0);
++    expect(out).toHaveLength(1);
++    expect(JSON.parse(out[0].content).text).toBe('I am thinking about this...');
++    expect(out[0].platform_id).toBe('chan-1');
++    expect(out[0].channel_type).toBe('discord');
+ 
+     await loopPromise.catch(() => {});
+   });
+@@ -364,8 +368,11 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
+     let calls = 0;
+     const provider = new HookedMockProvider({}, () => {
+       calls += 1;
+-      // First result is unwrapped (triggers the retry nudge), second is wrapped.
+-      return calls === 1 ? 'unwrapped text' : '<message to="discord-test">wrapped now</message>';
++      // First result targets an UNKNOWN destination (the one case that still
++      // triggers the retry nudge post-PATCH 21), second is correctly wrapped.
++      return calls === 1
++        ? '<message to="no-such-dest">misrouted text</message>'
++        : '<message to="discord-test">wrapped now</message>';
+     });
+     const controller = new AbortController();
+     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
+diff --git a/container/agent-runner/src/message-blocks.test.ts b/container/agent-runner/src/message-blocks.test.ts
+index 47b5041..905884b 100644
+--- a/container/agent-runner/src/message-blocks.test.ts
++++ b/container/agent-runner/src/message-blocks.test.ts
+@@ -1,6 +1,6 @@
+ import { describe, it, expect } from 'bun:test';
+ 
+-import { parseMessageBlocks, countMessageBlockOpenTags, buildRewrapReminder } from './message-blocks';
++import { parseMessageBlocks, countMessageBlockOpenTags, buildRewrapReminder, salvageUnwrappedReply } from './message-blocks';
+ 
+ describe('parseMessageBlocks — tolerant closing tag (PATCH 12, turn-stall fix)', () => {
+   it('REGRESSION: a block closed with </parameter> instead of </message> is parsed (not discarded)', () => {
+@@ -107,3 +107,28 @@ describe('buildRewrapReminder — specific feedback (PATCH 12)', () => {
+     expect(r).toContain('are not valid');
+   });
+ });
++
++describe('salvageUnwrappedReply (PATCH 21)', () => {
++  it('returns bare reply text unchanged (trimmed)', () => {
++    expect(salvageUnwrappedReply('  Hier die Antwort.  ')).toBe('Hier die Antwort.');
++  });
++
++  it('strips attribute-less / unclosed <message> tag remnants', () => {
++    expect(salvageUnwrappedReply('<message>Antwort ohne to')).toBe('Antwort ohne to');
++    expect(salvageUnwrappedReply('<message to="x">Antwort unclosed')).toBe('Antwort unclosed');
++    expect(salvageUnwrappedReply('<message to="x">Antwort</message>')).toBe('Antwort');
++  });
++
++  it('strips a stray trailing </parameter> / </invoke> but keeps mid-body mentions', () => {
++    expect(salvageUnwrappedReply('Antwort</parameter>')).toBe('Antwort');
++    expect(salvageUnwrappedReply('Nutze `</parameter>` als Tag — so gehts.')).toBe(
++      'Nutze `</parameter>` als Tag — so gehts.',
++    );
++  });
++
++  it('returns null for empty / whitespace-only / tag-only input', () => {
++    expect(salvageUnwrappedReply('')).toBeNull();
++    expect(salvageUnwrappedReply('   \n ')).toBeNull();
++    expect(salvageUnwrappedReply('<message to="x"></message>')).toBeNull();
++  });
++});
+diff --git a/container/agent-runner/src/message-blocks.ts b/container/agent-runner/src/message-blocks.ts
+index 8435ac8..d040f10 100644
+--- a/container/agent-runner/src/message-blocks.ts
++++ b/container/agent-runner/src/message-blocks.ts
+@@ -71,6 +71,34 @@ export function countMessageBlockOpenTags(text: string): number {
+   return (text.match(/<message\b[^>]*>/g) ?? []).length;
+ }
+ 
++/**
++ * PATCH 21 — best-effort salvage of an unwrapped reply.
++ *
++ * When a turn ends with zero deliverable <message> blocks, the root cause is
++ * almost always that the model never TYPED the wrapper (verified against raw
++ * API transcripts: 8/9 production failures had zero `<message` opening tags
++ * anywhere in the turn — the accumulation pipeline loses nothing). The final
++ * assistant text chunk in those turns IS the intended user-facing reply, so
++ * instead of dropping it (or burning re-prompt turns), the poll-loop delivers
++ * it directly after cleaning it up here.
++ *
++ * Cleanup: remove any <message ...> opening-tag remnants (covers the
++ * attribute-less / unclosed variants the tolerant parser can't bind to a
++ * destination), remove </message> closers, and — mirroring PATCH 13 — strip a
++ * stray </parameter>/</invoke> only at the TRUE END of the text. Caller is
++ * expected to have stripped <internal> blocks already (stripInternalTags).
++ * Returns null when nothing user-facing remains.
++ */
++export function salvageUnwrappedReply(text: string): string | null {
++  const cleaned = text
++    .replace(/<message\b[^>]*>/g, '')
++    .replace(/<\/message>/g, '')
++    .trim()
++    .replace(TRAILING_STRAY_CLOSE, '')
++    .trimEnd();
++  return cleaned.length > 0 ? cleaned : null;
++}
++
+ /**
+  * Build the in-turn re-prompt reminder for a discarded response, naming the
+  * ACTUAL problem (so the model can self-correct instead of repeating it) and
+diff --git a/container/agent-runner/src/poll-loop.test.ts b/container/agent-runner/src/poll-loop.test.ts
+index c9cd31b..2429ddf 100644
+--- a/container/agent-runner/src/poll-loop.test.ts
++++ b/container/agent-runner/src/poll-loop.test.ts
+@@ -427,17 +427,117 @@ describe('error result with no <message> envelope', () => {
+     expect(pushes).toHaveLength(0);
+   });
+ 
+-  it('still nudges (and does not deliver) a normal unwrapped result', async () => {
++  it('PATCH 21: a normal unwrapped result is now fallback-delivered, not nudged', async () => {
++    // Pre-21 behavior: re-prompt nudge, nothing delivered. Confirmed against
++    // raw API transcripts that the wrapper is never emitted in these turns —
++    // the nudge burned turns and often still failed, so the final text is
++    // delivered directly instead.
+     const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare text, no envelope' });
+ 
+     await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+ 
++    const out = getUndeliveredMessages();
++    expect(out).toHaveLength(1);
++    expect(JSON.parse(out[0].content).text).toBe('bare text, no envelope');
++    expect(pushes).toHaveLength(0);
++  });
++});
++
++describe('unwrapped-reply fallback delivery (PATCH 21)', () => {
++  it('REGRESSION: model omits the <message> wrapper on a long tool-chain turn — final chunk is delivered', async () => {
++    // Exact production failure shape (dm-with-robby, 2026-07-02): the turn
++    // accumulated several bare narration chunks, the FINAL chunk was the
++    // intended reply, and the whole turn contained ZERO <message> tags.
++    const accumulated =
++      'Go. 💪 Ich code den Slice jetzt — erst lese ich die Spec:\n' +
++      'Klarer Vertrag — genau was ich brauche.\n' +
++      'Fertig gebaut. Hier das Ergebnis: alles grün, 3 Tests bestanden.';
++    const lastText = 'Fertig gebaut. Hier das Ergebnis: alles grün, 3 Tests bestanden.';
++    const { query, pushes } = makeResultQuery({ type: 'result', text: accumulated, lastText });
++
++    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
++
++    const out = getUndeliveredMessages();
++    expect(out).toHaveLength(1);
++    // Only the final chunk is delivered — not the accumulated narration.
++    expect(JSON.parse(out[0].content).text).toBe(lastText);
++    expect(out[0].platform_id).toBe('chan-1');
++    // No re-wrap nudge for a missing wrapper.
++    expect(pushes).toHaveLength(0);
++  });
++
++  it('internal-only final chunk: nothing is delivered and nothing is nudged', async () => {
++    // The model explicitly ended on a no-reply note (e.g. reply already sent
++    // via the send_message MCP tool). Nudging here produced apology noise.
++    const { query, pushes } = makeResultQuery({
++      type: 'result',
++      text: 'Turing-Test durch — Ergebnis lesen:\n🎯 Gate BESTANDEN',
++      lastText: '<internal>Already delivered via send_message (id 39175). Nothing further to send.</internal>',
++    });
++
++    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
++
++    expect(getUndeliveredMessages()).toHaveLength(0);
++    expect(pushes).toHaveLength(0);
++  });
++
++  it('unclosed / attribute-less <message> tag: body is salvaged and delivered', async () => {
++    const lastText = '<message>Hier die eigentliche Antwort ohne to-Attribut';
++    const { query, pushes } = makeResultQuery({ type: 'result', text: lastText, lastText });
++
++    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
++
++    const out = getUndeliveredMessages();
++    expect(out).toHaveLength(1);
++    expect(JSON.parse(out[0].content).text).toBe('Hier die eigentliche Antwort ohne to-Attribut');
++    expect(pushes).toHaveLength(0);
++  });
++
++  it('agent-to-agent channel: never fallback-delivered (self-loop guard)', async () => {
++    // A bare reply auto-delivered onto the A2A channel can bounce back as a
++    // new inbound to the same group and self-loop. Logged, not delivered.
++    const a2aRouting = { platformId: 'ag-self-1', channelType: 'agent', threadId: null, inReplyTo: 'm1' };
++    const { query, pushes } = makeResultQuery({
++      type: 'result',
++      text: 'bare reply on the agent channel',
++      lastText: 'bare reply on the agent channel',
++    });
++
++    await processQuery(query, a2aRouting, ['m1'], 'claude', undefined, 'prompt', undefined);
++
++    expect(getUndeliveredMessages()).toHaveLength(0);
++    expect(pushes).toHaveLength(0);
++  });
++
++  it('unknown destination still gets the specific re-prompt (not fallback-delivered on first try)', async () => {
++    const text = '<message to="nope">Antwort an falschen Namen</message>';
++    const { query, pushes } = makeResultQuery({ type: 'result', text, lastText: text });
++
++    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
++
+     expect(getUndeliveredMessages()).toHaveLength(0);
+     expect(pushes).toHaveLength(1);
+-    // PATCH 12 replaced the generic nudge with buildRewrapReminder ("...was
+-    // NOT delivered. ..."), which is more specific. Match the concept
+-    // case-insensitively rather than upstream's exact lowercase wording.
+-    expect(pushes[0]).toMatch(/not delivered/i);
++    expect(pushes[0]).toMatch(/not valid/i);
++  });
++
++  it('wrapped block delivered normally → no fallback duplicate, trailing narration stays scratchpad', async () => {
++    // Guard against double-delivery: when a block WAS dispatched, the bare
++    // trailing text must not additionally be fallback-delivered.
++    getInboundDb()
++      .prepare(
++        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
++         VALUES ('Robby', 'Robby', 'channel', 'discord', 'chan-1', NULL)`,
++      )
++      .run();
++    const text = '<message to="Robby">echte Antwort</message>\nnoch etwas Notiz-Text';
++    const { query, pushes } = makeResultQuery({ type: 'result', text, lastText: text });
++
++    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
++
++    const out = getUndeliveredMessages();
++    expect(out).toHaveLength(1);
++    expect(JSON.parse(out[0].content).text).toBe('echte Antwort');
++    expect(pushes).toHaveLength(0);
+   });
+ });
+ 
+diff --git a/container/agent-runner/src/poll-loop.ts b/container/agent-runner/src/poll-loop.ts
+index a407565..d607396 100644
+--- a/container/agent-runner/src/poll-loop.ts
++++ b/container/agent-runner/src/poll-loop.ts
+@@ -14,13 +14,20 @@ import {
+   type RoutingContext,
+ } from './formatter.js';
+ import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
+-import { buildRewrapReminder, countMessageBlockOpenTags, parseMessageBlocks } from './message-blocks.js';
++import {
++  buildRewrapReminder,
++  countMessageBlockOpenTags,
++  parseMessageBlocks,
++  salvageUnwrappedReply,
++} from './message-blocks.js';
+ import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+ 
+ const POLL_INTERVAL_MS = 1000;
+ const ACTIVE_POLL_INTERVAL_MS = 500;
+-// PATCH 12: max in-turn re-prompts when a final response is discarded
+-// (unwrapped / malformed / unknown-destination) before giving up loudly.
++// PATCH 12/21: max in-turn re-prompts when a block targeted an UNKNOWN
++// destination name (the one case where the model has to fix its own output —
++// we have the body but not the routing). A missing wrapper no longer
++// re-prompts at all: PATCH 21 salvages and delivers the final text directly.
+ const MAX_UNWRAPPED_RETRIES = 2;
+ 
+ /**
+@@ -501,36 +508,51 @@ export async function processQuery(
+             });
+             archivePrompts.shift();
+           } else {
+-            // PATCH 12: cap re-prompts with a COUNTER (was a single bool, so the
+-            // turn gave up after one retry and idled until the next inbound).
+-            const willRetryWrapping = hasUnwrapped && unwrappedRetries < MAX_UNWRAPPED_RETRIES;
++            // PATCH 12/21: re-prompt ONLY for unknown-destination blocks (the
++            // model must fix its own routing; capped counter). A missing
++            // wrapper means the model never typed it — re-prompting burns
++            // turns and often still fails, so salvage the final assistant
++            // text and deliver it to the triggering channel instead.
++            const willRetryWrapping =
++              hasUnwrapped && unknownDestinations.length > 0 && unwrappedRetries < MAX_UNWRAPPED_RETRIES;
++            let salvaged: string | null = null;
++            // Never fallback-deliver on the agent-to-agent channel: the
++            // triggering "channel" is another agent (or a self-addressed wake
++            // message), so an auto-delivered bare reply can bounce back as a
++            // new inbound and self-loop. A2A peers use send_message / wrapped
++            // blocks; a dropped bare reply there is logged, not delivered.
++            const fallbackAllowed = routing.channelType !== 'agent';
++            if (hasUnwrapped && !willRetryWrapping && fallbackAllowed) {
++              salvaged = salvageUnwrappedReply(stripInternalTags(event.lastText ?? event.text ?? ''));
++              if (salvaged) {
++                log(
++                  `[fallback-delivery] no deliverable <message> block — delivering final assistant text ` +
++                    `(${salvaged.length} chars) to ${routing.channelType}:${routing.platformId}`,
++                );
++                deliverToTriggeringChannel(salvaged, routing);
++              } else {
++                // Final chunk was <internal>-only or empty: the model
++                // explicitly ended on a no-reply note (e.g. "already sent via
++                // send_message tool") — treat the turn as complete, no nudge.
++                log(`No deliverable <message> block and final text is internal-only/empty — treating turn as no-reply`);
++              }
++            }
+             notifyExchangeComplete(onExchangeComplete, {
+               prompt: archivePrompts[0] ?? initialPrompt,
+               result: event.text,
+               continuation: queryContinuation ?? initialContinuation,
+-              status: hasUnwrapped ? 'undelivered' : 'completed',
++              status: hasUnwrapped && !salvaged ? 'undelivered' : 'completed',
+             });
+             if (willRetryWrapping) {
+               unwrappedRetries++;
+               // PATCH 12: re-prompt IN-TURN with SPECIFIC feedback (the real
+-              // reason — unknown destination name, or malformed/wrong closing
+-              // tag) so the model can self-correct instead of repeating it.
++              // unknown destination name) so the model can self-correct.
+               const names = getAllDestinations().map((d) => d.name);
+               log(
+                 `Discarded response (re-prompt ${unwrappedRetries}/${MAX_UNWRAPPED_RETRIES}) — ` +
+-                  (unknownDestinations.length
+-                    ? `unknown destination(s): ${unknownDestinations.join(', ')}; valid: ${names.join(', ')}`
+-                    : `no deliverable <message> block`),
++                  `unknown destination(s): ${unknownDestinations.join(', ')}; valid: ${names.join(', ')}`,
+               );
+               query.push(buildRewrapReminder(unknownDestinations, names));
+-            } else if (hasUnwrapped) {
+-              // PATCH 12: cap exhausted — give up LOUDLY rather than silently
+-              // idling until the next inbound wakes the turn.
+-              log(
+-                `WARNING: response still not deliverable after ${unwrappedRetries} re-prompt(s) — giving up; ` +
+-                  `the user gets no reply for this turn` +
+-                  (unknownDestinations.length ? ` (unknown destination(s): ${unknownDestinations.join(', ')})` : ''),
+-              );
+             }
+             // The wrapping-retry result answers the SAME user prompt — keep it
+             // queued so the retry archives against it, not the nudge text.
+@@ -598,6 +620,15 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
+  */
+ function deliverErrorResult(text: string, routing: RoutingContext): void {
+   log('Error result with no <message> envelope — delivering to channel');
++  deliverToTriggeringChannel(text, routing);
++}
++
++/**
++ * Write bare (non-<message>-wrapped) text straight to the channel the batch
++ * arrived on. Shared by the error-result path and the PATCH 21 unwrapped-reply
++ * fallback delivery.
++ */
++function deliverToTriggeringChannel(text: string, routing: RoutingContext): void {
+   writeMessageOut({
+     id: generateId(),
+     in_reply_to: routing.inReplyTo,
+diff --git a/container/agent-runner/src/providers/claude.ts b/container/agent-runner/src/providers/claude.ts
+index a7fddb9..5a6fa38 100644
+--- a/container/agent-runner/src/providers/claude.ts
++++ b/container/agent-runner/src/providers/claude.ts
+@@ -448,6 +448,12 @@ export class ClaudeProvider implements AgentProvider {
+       // before a trailing tool_use (common on long tool chains) would otherwise
+       // be dropped. Reset on each result (turn boundary / follow-up push).
+       let turnText = '';
++      // PATCH 21: also track the LAST non-empty main-agent text chunk. When
++      // the model omits the <message> wrapper entirely (confirmed against raw
++      // API transcripts — the wrapper is never emitted, not lost in code),
++      // this final chunk is the intended reply; the poll-loop delivers it as
++      // a fallback instead of dropping the turn.
++      let lastChunk: string | null = null;
+       for await (const message of sdkResult) {
+         if (aborted) return;
+         messageCount++;
+@@ -460,7 +466,9 @@ export class ClaudeProvider implements AgentProvider {
+         } else if (message.type === 'assistant') {
+           // PATCH 11: capture main-agent text as it streams (sub-agent/Task
+           // messages carry parent_tool_use_id and are excluded).
+-          turnText = appendTurnText(turnText, extractMainAgentText(message as AssistantLikeMessage));
++          const chunk = extractMainAgentText(message as AssistantLikeMessage);
++          turnText = appendTurnText(turnText, chunk);
++          if (chunk.trim()) lastChunk = chunk; // PATCH 21
+         } else if (message.type === 'result') {
+           // MERGE (PATCH 11 + upstream error-surfacing): `result` text exists
+           // only on subtype:"success"; error subtypes (e.g. a non-retryable 403
+@@ -474,8 +482,10 @@ export class ClaudeProvider implements AgentProvider {
+           // from the full accumulated turn text (a superset of result.result),
+           // falling back to resultText if nothing was captured.
+           const text = isError ? resultText : resolveTurnDispatchText(turnText, resultText);
++          const lastText = lastChunk ?? resultText; // PATCH 21
+           turnText = '';
+-          yield { type: 'result', text, isError };
++          lastChunk = null;
++          yield { type: 'result', text, isError, lastText };
+         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
+           yield { type: 'error', message: 'API retry', retryable: true };
+         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
+diff --git a/container/agent-runner/src/providers/types.ts b/container/agent-runner/src/providers/types.ts
+index 00c6648..1064ea1 100644
+--- a/container/agent-runner/src/providers/types.ts
++++ b/container/agent-runner/src/providers/types.ts
+@@ -131,7 +131,16 @@ export type ProviderEvent =
+    * poll-loop uses it to surface the result text to the user instead of
+    * dropping it as un-wrapped scratchpad, and to skip the re-wrap nudge.
+    */
+-  | { type: 'result'; text: string | null; isError?: boolean }
++  /**
++   * `lastText` (PATCH 21) is the FINAL main-agent text chunk of the turn (the
++   * last assistant text block, as opposed to `text` which accumulates every
++   * chunk). The poll-loop uses it to salvage an unwrapped reply: when the
++   * model forgets the <message to="..."> envelope entirely, the last chunk is
++   * the intended reply and gets delivered to the triggering channel directly.
++   * Optional — providers that emit a single final text can omit it (the loop
++   * falls back to `text`).
++   */
++  | { type: 'result'; text: string | null; isError?: boolean; lastText?: string | null }
+   | { type: 'error'; message: string; retryable: boolean; classification?: string }
+   | { type: 'progress'; message: string }
+   /**

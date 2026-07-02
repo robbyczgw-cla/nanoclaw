@@ -14,13 +14,20 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
-import { buildRewrapReminder, countMessageBlockOpenTags, parseMessageBlocks } from './message-blocks.js';
+import {
+  buildRewrapReminder,
+  countMessageBlockOpenTags,
+  parseMessageBlocks,
+  salvageUnwrappedReply,
+} from './message-blocks.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
-// PATCH 12: max in-turn re-prompts when a final response is discarded
-// (unwrapped / malformed / unknown-destination) before giving up loudly.
+// PATCH 12/21: max in-turn re-prompts when a block targeted an UNKNOWN
+// destination name (the one case where the model has to fix its own output —
+// we have the body but not the routing). A missing wrapper no longer
+// re-prompts at all: PATCH 21 salvages and delivers the final text directly.
 const MAX_UNWRAPPED_RETRIES = 2;
 
 /**
@@ -501,36 +508,51 @@ export async function processQuery(
             });
             archivePrompts.shift();
           } else {
-            // PATCH 12: cap re-prompts with a COUNTER (was a single bool, so the
-            // turn gave up after one retry and idled until the next inbound).
-            const willRetryWrapping = hasUnwrapped && unwrappedRetries < MAX_UNWRAPPED_RETRIES;
+            // PATCH 12/21: re-prompt ONLY for unknown-destination blocks (the
+            // model must fix its own routing; capped counter). A missing
+            // wrapper means the model never typed it — re-prompting burns
+            // turns and often still fails, so salvage the final assistant
+            // text and deliver it to the triggering channel instead.
+            const willRetryWrapping =
+              hasUnwrapped && unknownDestinations.length > 0 && unwrappedRetries < MAX_UNWRAPPED_RETRIES;
+            let salvaged: string | null = null;
+            // Never fallback-deliver on the agent-to-agent channel: the
+            // triggering "channel" is another agent (or a self-addressed wake
+            // message), so an auto-delivered bare reply can bounce back as a
+            // new inbound and self-loop. A2A peers use send_message / wrapped
+            // blocks; a dropped bare reply there is logged, not delivered.
+            const fallbackAllowed = routing.channelType !== 'agent';
+            if (hasUnwrapped && !willRetryWrapping && fallbackAllowed) {
+              salvaged = salvageUnwrappedReply(stripInternalTags(event.lastText ?? event.text ?? ''));
+              if (salvaged) {
+                log(
+                  `[fallback-delivery] no deliverable <message> block — delivering final assistant text ` +
+                    `(${salvaged.length} chars) to ${routing.channelType}:${routing.platformId}`,
+                );
+                deliverToTriggeringChannel(salvaged, routing);
+              } else {
+                // Final chunk was <internal>-only or empty: the model
+                // explicitly ended on a no-reply note (e.g. "already sent via
+                // send_message tool") — treat the turn as complete, no nudge.
+                log(`No deliverable <message> block and final text is internal-only/empty — treating turn as no-reply`);
+              }
+            }
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
               continuation: queryContinuation ?? initialContinuation,
-              status: hasUnwrapped ? 'undelivered' : 'completed',
+              status: hasUnwrapped && !salvaged ? 'undelivered' : 'completed',
             });
             if (willRetryWrapping) {
               unwrappedRetries++;
               // PATCH 12: re-prompt IN-TURN with SPECIFIC feedback (the real
-              // reason — unknown destination name, or malformed/wrong closing
-              // tag) so the model can self-correct instead of repeating it.
+              // unknown destination name) so the model can self-correct.
               const names = getAllDestinations().map((d) => d.name);
               log(
                 `Discarded response (re-prompt ${unwrappedRetries}/${MAX_UNWRAPPED_RETRIES}) — ` +
-                  (unknownDestinations.length
-                    ? `unknown destination(s): ${unknownDestinations.join(', ')}; valid: ${names.join(', ')}`
-                    : `no deliverable <message> block`),
+                  `unknown destination(s): ${unknownDestinations.join(', ')}; valid: ${names.join(', ')}`,
               );
               query.push(buildRewrapReminder(unknownDestinations, names));
-            } else if (hasUnwrapped) {
-              // PATCH 12: cap exhausted — give up LOUDLY rather than silently
-              // idling until the next inbound wakes the turn.
-              log(
-                `WARNING: response still not deliverable after ${unwrappedRetries} re-prompt(s) — giving up; ` +
-                  `the user gets no reply for this turn` +
-                  (unknownDestinations.length ? ` (unknown destination(s): ${unknownDestinations.join(', ')})` : ''),
-              );
             }
             // The wrapping-retry result answers the SAME user prompt — keep it
             // queued so the retry archives against it, not the nudge text.
@@ -598,6 +620,15 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  */
 function deliverErrorResult(text: string, routing: RoutingContext): void {
   log('Error result with no <message> envelope — delivering to channel');
+  deliverToTriggeringChannel(text, routing);
+}
+
+/**
+ * Write bare (non-<message>-wrapped) text straight to the channel the batch
+ * arrived on. Shared by the error-result path and the PATCH 21 unwrapped-reply
+ * fallback delivery.
+ */
+function deliverToTriggeringChannel(text: string, routing: RoutingContext): void {
   writeMessageOut({
     id: generateId(),
     in_reply_to: routing.inReplyTo,

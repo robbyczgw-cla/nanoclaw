@@ -72,6 +72,34 @@ export function countMessageBlockOpenTags(text: string): number {
 }
 
 /**
+ * PATCH 21 — best-effort salvage of an unwrapped reply.
+ *
+ * When a turn ends with zero deliverable <message> blocks, the root cause is
+ * almost always that the model never TYPED the wrapper (verified against raw
+ * API transcripts: 8/9 production failures had zero `<message` opening tags
+ * anywhere in the turn — the accumulation pipeline loses nothing). The final
+ * assistant text chunk in those turns IS the intended user-facing reply, so
+ * instead of dropping it (or burning re-prompt turns), the poll-loop delivers
+ * it directly after cleaning it up here.
+ *
+ * Cleanup: remove any <message ...> opening-tag remnants (covers the
+ * attribute-less / unclosed variants the tolerant parser can't bind to a
+ * destination), remove </message> closers, and — mirroring PATCH 13 — strip a
+ * stray </parameter>/</invoke> only at the TRUE END of the text. Caller is
+ * expected to have stripped <internal> blocks already (stripInternalTags).
+ * Returns null when nothing user-facing remains.
+ */
+export function salvageUnwrappedReply(text: string): string | null {
+  const cleaned = text
+    .replace(/<message\b[^>]*>/g, '')
+    .replace(/<\/message>/g, '')
+    .trim()
+    .replace(TRAILING_STRAY_CLOSE, '')
+    .trimEnd();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+/**
  * Build the in-turn re-prompt reminder for a discarded response, naming the
  * ACTUAL problem (so the model can self-correct instead of repeating it) and
  * listing the valid destination names.

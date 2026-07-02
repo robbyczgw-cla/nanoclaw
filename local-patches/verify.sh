@@ -178,6 +178,16 @@ else
   ALL_OK=false
 fi
 
+# Patch 21 — fallback delivery for unwrapped replies
+if grep -q 'salvageUnwrappedReply' container/agent-runner/src/poll-loop.ts 2>/dev/null \
+   && grep -q 'export function salvageUnwrappedReply' container/agent-runner/src/message-blocks.ts 2>/dev/null \
+   && grep -q 'lastText' container/agent-runner/src/providers/claude.ts 2>/dev/null; then
+  echo "✅ 21-unwrapped-reply-fallback applied"
+else
+  echo "❌ 21-unwrapped-reply-fallback MISSING (or partial — check poll-loop + message-blocks + claude.ts)"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0
