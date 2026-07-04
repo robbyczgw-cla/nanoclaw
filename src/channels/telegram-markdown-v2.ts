@@ -38,6 +38,51 @@ const PLACEHOLDER_SUFFIX = '\x00';
  */
 const SINGLE_STAR_BOLD = /(?<!\*)\*(?!\*)([^\s*][^*\n]*?)\*(?!\*)/g;
 
+/**
+ * PATCH 22 — harden model output against two @chat-adapter/telegram converter
+ * bugs that reject the whole send with "can't parse entities" (fable/sonnet
+ * emit the triggering shapes; opus' style happens not to):
+ *
+ * 1. "Can't find end of a URL": the adapter's `trimToMarkdownV2SafeBoundary`
+ *    runs before EVERY MarkdownV2 send and slices the text at the last
+ *    "unpaired" entity marker — but it counts `_` / `*` / `~` / backticks
+ *    INSIDE link URLs, where Telegram's spec deliberately leaves them
+ *    unescaped (`escapeLinkUrl` only escapes `)` and `\`). An odd number of
+ *    `_` across the message's URLs ⇒ the send is cut MID-URL ⇒ Telegram
+ *    rejects the unterminated URL entity. Fix: percent-encode the four
+ *    entity-marker chars inside link destinations and bare URLs before the
+ *    converter ever sees them (`_`→%5F etc. — semantically identical URLs).
+ *
+ * 2. "Can't find end of Underline entity": nested/unbalanced emphasis like
+ *    `__weitgehend gelöst_ … _` parses as emphasis-inside-emphasis, which the
+ *    renderer emits as ADJACENT underscores (`__x_ y_`). Telegram tokenizes
+ *    `__` as one underline-open with no close ⇒ reject. (The adapter's parity
+ *    check counts single chars — 4 underscores = "balanced" — so it doesn't
+ *    catch it.) Fix: rewrite balanced `__x__` to `**x**` (bold, no
+ *    underscores in output) and escape any leftover `__` run to literals so
+ *    the parser can never produce adjacent-underscore emphasis nesting.
+ */
+const LINK_DEST = /\]\(([^)\s]+)\)/g;
+const BARE_URL = /(?<!\]\()https?:\/\/[^\s<>)]+/g;
+const URL_ENTITY_MARKERS = /[_*~`]/g;
+const URL_MARKER_ENCODING: Record<string, string> = { _: '%5F', '*': '%2A', '~': '%7E', '`': '%60' };
+const BALANCED_UNDERSCORE_STRONG = /__([^_\n]+?)__/g;
+
+function encodeUrlEntityMarkers(url: string): string {
+  return url.replace(URL_ENTITY_MARKERS, (c) => URL_MARKER_ENCODING[c]);
+}
+
+export function hardenForTelegramV2(text: string): string {
+  // 1) entity-marker chars inside link destinations and bare URLs → %-encoded
+  let t = text.replace(LINK_DEST, (_m, url: string) => `](${encodeUrlEntityMarkers(url)})`);
+  t = t.replace(BARE_URL, (m) => encodeUrlEntityMarkers(m));
+  // 2) balanced __strong__ → **strong** (renders bold; output has no `__`)
+  t = t.replace(BALANCED_UNDERSCORE_STRONG, '**$1**');
+  // 3) leftover (unbalanced) `__` runs → escaped literals
+  t = t.replace(/__+/g, (m) => m.replace(/_/g, '\\_'));
+  return t;
+}
+
 export function telegramV1ToCommonMark(input: string): string {
   if (!input) return input;
 
@@ -47,6 +92,8 @@ export function telegramV1ToCommonMark(input: string): string {
     return `${PLACEHOLDER_PREFIX}${codeSegments.length - 1}${PLACEHOLDER_SUFFIX}`;
   });
 
+  // PATCH 22 first (URLs then contain no `*`, so bold promotion can't touch them)
+  text = hardenForTelegramV2(text);
   text = text.replace(SINGLE_STAR_BOLD, '**$1**');
 
   return text.replace(

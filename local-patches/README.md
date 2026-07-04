@@ -30,6 +30,7 @@ This directory tracks every local source-code modification applied to `/root/nan
 | 18 | `src/channels/telegram-rich-message.ts` + `telegram.ts` | Broaden rich routing to MarkdownV2-impossible constructs (headings, `<details>`, dividers, block math, task lists) + TDesktop crash-guard | candidate (generic) | 🟢 local-only |
 | 20 | `container/agent-runner/src/mcp-tools/core.ts` | Selectively eager-load core reply tools (`send_message`/`send_file`/`edit_message`/`add_reaction` via `_meta['anthropic/alwaysLoad']`) so Sonnet-5 doesn't loop on `ToolSearch` for `send_message` | candidate (generic) | 🟢 local-only |
 | 21 | `container/agent-runner/src/{poll-loop,message-blocks,providers/claude,providers/types}.ts` | Fallback delivery for unwrapped replies — model omits the `<message>` wrapper after long tool chains (verified in raw API transcripts); final text chunk is salvaged + delivered instead of re-prompt-looped. Consolidates the 11/12/13 delivery-robustness theme | candidate (generic) | 🟢 local-only |
+| 22 | `src/channels/telegram-markdown-v2.ts` | Telegram MarkdownV2 entity hardening — %-encode entity markers in URLs + neutralize unbalanced `__`, fixing `Can't find end of Underline entity` / `Can't find end of a URL` rejects from fable/sonnet output (both root causes are @chat-adapter/telegram bugs) | candidate (upstream: vercel/chat) | 🟢 local-only |
 
 **Apply order matters:** 02 must be applied before 03 — 03's apply-script anchors on strings introduced by 02. Patch 01 is independent of 02/03.
 

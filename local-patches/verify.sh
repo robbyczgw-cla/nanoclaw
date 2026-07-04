@@ -188,6 +188,14 @@ else
   ALL_OK=false
 fi
 
+# Patch 22 — Telegram MarkdownV2 entity hardening (Underline/URL rejects)
+if grep -q 'hardenForTelegramV2' src/channels/telegram-markdown-v2.ts 2>/dev/null; then
+  echo "✅ 22-telegram-v2-entity-hardening applied"
+else
+  echo "❌ 22-telegram-v2-entity-hardening MISSING"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

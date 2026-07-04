@@ -1,0 +1,216 @@
+diff --git a/src/channels/telegram-markdown-v2.test.ts b/src/channels/telegram-markdown-v2.test.ts
+index 96919f1..af15d05 100644
+--- a/src/channels/telegram-markdown-v2.test.ts
++++ b/src/channels/telegram-markdown-v2.test.ts
+@@ -46,3 +46,146 @@ describe('telegramV1ToCommonMark', () => {
+     expect(telegramV1ToCommonMark('')).toBe('');
+   });
+ });
++
++/**
++ * PATCH 22 — regression tests against the REAL @chat-adapter/telegram
++ * converter, reproducing the two live failure families from
++ * logs/nanoclaw.error.log ("Can't find end of Underline entity" /
++ * "Can't find end of a URL"). Red without hardenForTelegramV2, green with it.
++ */
++import { TelegramFormatConverter } from '@chat-adapter/telegram';
++import { hardenForTelegramV2 } from './telegram-markdown-v2.js';
++
++const converter = new TelegramFormatConverter();
++const convert = (raw: string): string =>
++  converter.fromAst(converter.toAst(raw));
++
++/**
++ * Minimal model of Telegram's MarkdownV2 entity scanner — just enough to
++ * reject what the Bot API rejects in our two failure families: an unclosed
++ * `__` underline entity and an unterminated `](…` URL. Returns null if OK,
++ * else a description.
++ */
++function findUnclosedEntity(text: string): string | null {
++  let i = 0;
++  let bold = false,
++    italic = false,
++    underline = false,
++    strike = false,
++    code = false;
++  while (i < text.length) {
++    const c = text[i];
++    if (c === '\\') {
++      i += 2;
++      continue;
++    }
++    if (c === '`') {
++      code = !code;
++      i++;
++      continue;
++    }
++    if (code) {
++      i++;
++      continue;
++    }
++    if (c === '_' && text[i + 1] === '_') {
++      underline = !underline;
++      i += 2;
++      continue;
++    }
++    if (c === '_') {
++      italic = !italic;
++      i++;
++      continue;
++    }
++    if (c === '*') {
++      bold = !bold;
++      i++;
++      continue;
++    }
++    if (c === '~') {
++      strike = !strike;
++      i++;
++      continue;
++    }
++    if (c === ']' && text[i + 1] === '(') {
++      // URL entity: must terminate with an unescaped `)`
++      let j = i + 2;
++      let closed = false;
++      while (j < text.length) {
++        if (text[j] === '\\') {
++          j += 2;
++          continue;
++        }
++        if (text[j] === ')') {
++          closed = true;
++          break;
++        }
++        j++;
++      }
++      if (!closed) return `unterminated URL entity at ${i}`;
++      i = j + 1;
++      continue;
++    }
++    i++;
++  }
++  if (underline) return 'unclosed Underline entity';
++  if (italic) return 'unclosed Italic entity';
++  if (bold) return 'unclosed Bold entity';
++  if (strike) return 'unclosed Strikethrough entity';
++  if (code) return 'unclosed Code entity';
++  return null;
++}
++
++// Real payload shape from the 2026-06 Underline failures (fable/sonnet style:
++// nested/unbalanced __ emphasis).
++const UNDERLINE_PAYLOAD =
++  'Kurz: das alte Problem ist auf AzerothCore heute __weitgehend gelöst_ — aber mit Sternchen._\n\nHeute ist das anders.';
++
++// Real payload shape from the URL failures: odd number of `_` across link
++// destinations trips the adapter's safe-boundary trimmer into cutting MID-URL.
++const URL_PAYLOAD =
++  'Sources: [Generative Agents](https://github.com/joonspk-research/generative_agents) und bare https://github.com/a16z-infra/ai_town dazu.';
++
++describe('hardenForTelegramV2 (PATCH 22)', () => {
++  it('REGRESSION (a): unbalanced __ emphasis no longer yields adjacent underscores after conversion', () => {
++    const out = convert(hardenForTelegramV2(UNDERLINE_PAYLOAD));
++    expect(out).not.toMatch(/(?<!\\)__/);
++    expect(findUnclosedEntity(out)).toBeNull();
++  });
++
++  it('REGRESSION (b): `_` in link URLs is %-encoded so the adapter trimmer cannot cut mid-URL', () => {
++    const hardened = hardenForTelegramV2(URL_PAYLOAD);
++    expect(hardened).toContain('generative%5Fagents');
++    expect(hardened).toContain('ai%5Ftown');
++    const out = convert(hardened);
++    // No unescaped entity-marker underscores left anywhere → trimmer is a no-op.
++    expect(out).not.toMatch(/(?<!\\)_/);
++    expect(findUnclosedEntity(out)).toBeNull();
++  });
++
++  it('balanced __strong__ becomes bold (not underline) and survives conversion', () => {
++    const out = convert(hardenForTelegramV2('das ist __wichtig__ hier'));
++    expect(out).toContain('*wichtig*');
++    expect(findUnclosedEntity(out)).toBeNull();
++  });
++
++  it('normal messages are untouched (no false positives)', () => {
++    expect(hardenForTelegramV2('plain text with _italic_ and **bold**.')).toBe(
++      'plain text with _italic_ and **bold**.',
++    );
++    expect(hardenForTelegramV2('Link ohne Marker: [a](https://example.com/path)')).toBe(
++      'Link ohne Marker: [a](https://example.com/path)',
++    );
++  });
++
++  it('telegramV1ToCommonMark leaves code spans with underscores/URLs untouched', () => {
++    const input = 'see `github.com/a_b` and ```\nurl_with_under\n```';
++    expect(telegramV1ToCommonMark(input)).toBe(input);
++  });
++
++  it('wikipedia-style parens URL keeps working', () => {
++    const hardened = hardenForTelegramV2('https://en.wikipedia.org/wiki/Foo_(bar) ist gut');
++    expect(hardened).toContain('Foo%5F(bar');
++  });
++});
+diff --git a/src/channels/telegram-markdown-v2.ts b/src/channels/telegram-markdown-v2.ts
+index c79aa60..54744e1 100644
+--- a/src/channels/telegram-markdown-v2.ts
++++ b/src/channels/telegram-markdown-v2.ts
+@@ -38,6 +38,51 @@ const PLACEHOLDER_SUFFIX = '\x00';
+  */
+ const SINGLE_STAR_BOLD = /(?<!\*)\*(?!\*)([^\s*][^*\n]*?)\*(?!\*)/g;
+ 
++/**
++ * PATCH 22 — harden model output against two @chat-adapter/telegram converter
++ * bugs that reject the whole send with "can't parse entities" (fable/sonnet
++ * emit the triggering shapes; opus' style happens not to):
++ *
++ * 1. "Can't find end of a URL": the adapter's `trimToMarkdownV2SafeBoundary`
++ *    runs before EVERY MarkdownV2 send and slices the text at the last
++ *    "unpaired" entity marker — but it counts `_` / `*` / `~` / backticks
++ *    INSIDE link URLs, where Telegram's spec deliberately leaves them
++ *    unescaped (`escapeLinkUrl` only escapes `)` and `\`). An odd number of
++ *    `_` across the message's URLs ⇒ the send is cut MID-URL ⇒ Telegram
++ *    rejects the unterminated URL entity. Fix: percent-encode the four
++ *    entity-marker chars inside link destinations and bare URLs before the
++ *    converter ever sees them (`_`→%5F etc. — semantically identical URLs).
++ *
++ * 2. "Can't find end of Underline entity": nested/unbalanced emphasis like
++ *    `__weitgehend gelöst_ … _` parses as emphasis-inside-emphasis, which the
++ *    renderer emits as ADJACENT underscores (`__x_ y_`). Telegram tokenizes
++ *    `__` as one underline-open with no close ⇒ reject. (The adapter's parity
++ *    check counts single chars — 4 underscores = "balanced" — so it doesn't
++ *    catch it.) Fix: rewrite balanced `__x__` to `**x**` (bold, no
++ *    underscores in output) and escape any leftover `__` run to literals so
++ *    the parser can never produce adjacent-underscore emphasis nesting.
++ */
++const LINK_DEST = /\]\(([^)\s]+)\)/g;
++const BARE_URL = /(?<!\]\()https?:\/\/[^\s<>)]+/g;
++const URL_ENTITY_MARKERS = /[_*~`]/g;
++const URL_MARKER_ENCODING: Record<string, string> = { _: '%5F', '*': '%2A', '~': '%7E', '`': '%60' };
++const BALANCED_UNDERSCORE_STRONG = /__([^_\n]+?)__/g;
++
++function encodeUrlEntityMarkers(url: string): string {
++  return url.replace(URL_ENTITY_MARKERS, (c) => URL_MARKER_ENCODING[c]);
++}
++
++export function hardenForTelegramV2(text: string): string {
++  // 1) entity-marker chars inside link destinations and bare URLs → %-encoded
++  let t = text.replace(LINK_DEST, (_m, url: string) => `](${encodeUrlEntityMarkers(url)})`);
++  t = t.replace(BARE_URL, (m) => encodeUrlEntityMarkers(m));
++  // 2) balanced __strong__ → **strong** (renders bold; output has no `__`)
++  t = t.replace(BALANCED_UNDERSCORE_STRONG, '**$1**');
++  // 3) leftover (unbalanced) `__` runs → escaped literals
++  t = t.replace(/__+/g, (m) => m.replace(/_/g, '\\_'));
++  return t;
++}
++
+ export function telegramV1ToCommonMark(input: string): string {
+   if (!input) return input;
+ 
+@@ -47,6 +92,8 @@ export function telegramV1ToCommonMark(input: string): string {
+     return `${PLACEHOLDER_PREFIX}${codeSegments.length - 1}${PLACEHOLDER_SUFFIX}`;
+   });
+ 
++  // PATCH 22 first (URLs then contain no `*`, so bold promotion can't touch them)
++  text = hardenForTelegramV2(text);
+   text = text.replace(SINGLE_STAR_BOLD, '**$1**');
+ 
+   return text.replace(
