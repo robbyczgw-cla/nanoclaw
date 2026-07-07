@@ -164,6 +164,21 @@ function enqueueOutbound<T>(tid: string, fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
+/**
+ * PATCH 23: replace lone UTF-16 surrogates (an emoji cut in half by some
+ * upstream truncation) with U+FFFD. A lone surrogate is invalid UTF-8 on the
+ * wire — Telegram rejects the send ("text must be encoded in UTF-8"),
+ * including the plain-text fallback, so the message is dropped entirely.
+ * (Node 22 has String.prototype.toWellFormed; typed via a cast because the
+ * tsconfig lib predates ES2024. Regex fallback covers exotic runtimes.)
+ */
+export function toWellFormedText(t: string): string {
+  const fn = (t as unknown as { toWellFormed?: () => string }).toWellFormed;
+  return typeof fn === 'function'
+    ? fn.call(t)
+    : t.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
+}
+
 export function splitForLimit(text: string, limit: number): string[] {
   if (text.length <= limit) return [text];
   const chunks: string[] = [];
@@ -173,6 +188,10 @@ export function splitForLimit(text: string, limit: number): string[] {
     if (cut <= 0) cut = remaining.lastIndexOf('\n', limit);
     if (cut <= 0) cut = remaining.lastIndexOf(' ', limit);
     if (cut <= 0) cut = limit;
+    // PATCH 23: a hard cut must not land between the halves of a surrogate
+    // pair — back off one unit so the emoji moves whole into the next chunk.
+    const before = remaining.charCodeAt(cut - 1);
+    if (before >= 0xd800 && before <= 0xdbff) cut -= 1;
     chunks.push(remaining.slice(0, cut).trimEnd());
     remaining = remaining.slice(cut).trimStart();
   }
@@ -366,7 +385,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         `non-empty, only letters, digits, '.', '_' or '-'`,
     );
   }
-  const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
+  // PATCH 23: sanitize lone UTF-16 surrogates (e.g. an emoji cut in half by a
+  // preview truncation) at the single outbound choke point. One poisoned
+  // string otherwise makes the platform API reject with "text must be encoded
+  // in UTF-8" — including the plain-text fallback, so the message (and, via
+  // the pre-send tool-vis flush, EVERY later message on that chat) is dropped
+  // until a host restart.
+  const transformText = (t: string): string =>
+    toWellFormedText(config.transformOutboundText ? config.transformOutboundText(t) : t);
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
@@ -648,7 +674,19 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // pending coalesced state, PATCH 09) so the agent's actual answer
         // renders as a separate, fresh, notifying bubble below the completed
         // tool-vis timeline.
-        await finalizeToolVis(tid, accumKey);
+        // PATCH 23: never let a broken tool-vis bubble block the real reply —
+        // finalize failures are logged and the bubble dropped, not propagated
+        // (a propagated throw was attributed to the real message by delivery
+        // retry, permanently dropping every reply on this chat).
+        try {
+          await finalizeToolVis(tid, accumKey);
+        } catch (err) {
+          log.warn('Tool-vis finalize failed — dropping bubble, continuing with real message', {
+            tid,
+            err: String((err as { message?: string })?.message ?? err),
+          });
+          toolVisAccumulators.delete(accumKey);
+        }
 
         if (content.operation === 'edit' && content.messageId) {
           await adapter.editMessage(tid, content.messageId as string, {

@@ -116,8 +116,17 @@ function log(msg: string): void {
   console.error(`[tool-visibility] ${msg}`);
 }
 
+// PATCH 23: never cut inside a surrogate pair — a preview ending in half an
+// emoji is invalid UTF-8 and makes Telegram reject the whole tool-vis bubble
+// (and, via the pre-send flush, every later real message on that chat).
+export function safeSlice(s: string, n: number): string {
+  const cut = s.slice(0, n);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
 function truncate(s: string): string {
-  return s.length > MAX_INPUT_PREVIEW ? s.slice(0, MAX_INPUT_PREVIEW) + '…' : s;
+  return s.length > MAX_INPUT_PREVIEW ? safeSlice(s, MAX_INPUT_PREVIEW) + '…' : s;
 }
 
 /** Extract domain from URL — keeps preview compact ("github.com" not full URL). */
@@ -175,7 +184,7 @@ function resultShape(toolName: string, toolResponse: unknown): string | null {
     // the command actually produced what was expected. Trim to keep the
     // chat-line compact.
     const firstLine = allLines.find((l) => l.trim()) || '';
-    const peek = firstLine.replace(/\s+/g, ' ').trim().slice(0, 60);
+    const peek = safeSlice(firstLine.replace(/\s+/g, ' ').trim(), 60);
     if (nonEmpty >= 5) {
       return peek ? `${nonEmpty} lines  → \`${peek}\`` : `${nonEmpty} lines`;
     }
@@ -203,10 +212,10 @@ function detectFailureFromResponse(_toolName: string, toolResponse: unknown): st
       const explicit = typeof r.error === 'string' ? r.error
         : typeof r.message === 'string' ? r.message
         : 'failed';
-      return explicit.replace(/\s+/g, ' ').trim().slice(0, 80);
+      return safeSlice(explicit.replace(/\s+/g, ' ').trim(), 80);
     }
     if (typeof r.error === 'string' && r.error.trim()) {
-      return r.error.replace(/\s+/g, ' ').trim().slice(0, 80);
+      return safeSlice(r.error.replace(/\s+/g, ' ').trim(), 80);
     }
   }
   const text = extractResponseText(toolResponse);
@@ -221,7 +230,7 @@ function detectFailureFromResponse(_toolName: string, toolResponse: unknown): st
   ];
   for (const p of patterns) {
     const m = text.match(p);
-    if (m) return m[0].replace(/\s+/g, ' ').trim().slice(0, 80);
+    if (m) return safeSlice(m[0].replace(/\s+/g, ' ').trim(), 80);
   }
   return null;
 }
@@ -489,7 +498,7 @@ export const postToolUseVisibility: HookCallback = async (input, toolUseId) => {
 
   // FAILURE PATH 1 — explicit PostToolUseFailure event with `error` field.
   if (i.hook_event_name === 'PostToolUseFailure') {
-    const reason = (i.error ?? 'failed').replace(/\s+/g, ' ').trim().slice(0, 80);
+    const reason = safeSlice((i.error ?? 'failed').replace(/\s+/g, ' ').trim(), 80);
     const merged = desc ? `${desc}  ✗ ${reason}` : `✗ ${reason}`;
     emit(formatToolLine('❌', label, merged));
     return { continue: true };

@@ -196,6 +196,15 @@ else
   ALL_OK=false
 fi
 
+# Patch 23 — UTF-16 surrogate safety (half-emoji chat-bricking fix)
+if grep -q 'toWellFormedText' src/channels/chat-sdk-bridge.ts 2>/dev/null \
+   && grep -q 'safeSlice' container/agent-runner/src/hooks/tool-visibility.ts 2>/dev/null; then
+  echo "✅ 23-utf8-surrogate-safety applied"
+else
+  echo "❌ 23-utf8-surrogate-safety MISSING (or partial — check bridge + tool-visibility)"
+  ALL_OK=false
+fi
+
 if $ALL_OK; then
   echo "🦫 All patches present."
   exit 0

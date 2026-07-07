@@ -1,0 +1,182 @@
+diff --git a/container/agent-runner/src/hooks/tool-visibility.ts b/container/agent-runner/src/hooks/tool-visibility.ts
+index 050bc7c..08880e8 100644
+--- a/container/agent-runner/src/hooks/tool-visibility.ts
++++ b/container/agent-runner/src/hooks/tool-visibility.ts
+@@ -116,8 +116,17 @@ function log(msg: string): void {
+   console.error(`[tool-visibility] ${msg}`);
+ }
+ 
++// PATCH 23: never cut inside a surrogate pair — a preview ending in half an
++// emoji is invalid UTF-8 and makes Telegram reject the whole tool-vis bubble
++// (and, via the pre-send flush, every later real message on that chat).
++export function safeSlice(s: string, n: number): string {
++  const cut = s.slice(0, n);
++  const last = cut.charCodeAt(cut.length - 1);
++  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
++}
++
+ function truncate(s: string): string {
+-  return s.length > MAX_INPUT_PREVIEW ? s.slice(0, MAX_INPUT_PREVIEW) + '…' : s;
++  return s.length > MAX_INPUT_PREVIEW ? safeSlice(s, MAX_INPUT_PREVIEW) + '…' : s;
+ }
+ 
+ /** Extract domain from URL — keeps preview compact ("github.com" not full URL). */
+@@ -175,7 +184,7 @@ function resultShape(toolName: string, toolResponse: unknown): string | null {
+     // the command actually produced what was expected. Trim to keep the
+     // chat-line compact.
+     const firstLine = allLines.find((l) => l.trim()) || '';
+-    const peek = firstLine.replace(/\s+/g, ' ').trim().slice(0, 60);
++    const peek = safeSlice(firstLine.replace(/\s+/g, ' ').trim(), 60);
+     if (nonEmpty >= 5) {
+       return peek ? `${nonEmpty} lines  → \`${peek}\`` : `${nonEmpty} lines`;
+     }
+@@ -203,10 +212,10 @@ function detectFailureFromResponse(_toolName: string, toolResponse: unknown): st
+       const explicit = typeof r.error === 'string' ? r.error
+         : typeof r.message === 'string' ? r.message
+         : 'failed';
+-      return explicit.replace(/\s+/g, ' ').trim().slice(0, 80);
++      return safeSlice(explicit.replace(/\s+/g, ' ').trim(), 80);
+     }
+     if (typeof r.error === 'string' && r.error.trim()) {
+-      return r.error.replace(/\s+/g, ' ').trim().slice(0, 80);
++      return safeSlice(r.error.replace(/\s+/g, ' ').trim(), 80);
+     }
+   }
+   const text = extractResponseText(toolResponse);
+@@ -221,7 +230,7 @@ function detectFailureFromResponse(_toolName: string, toolResponse: unknown): st
+   ];
+   for (const p of patterns) {
+     const m = text.match(p);
+-    if (m) return m[0].replace(/\s+/g, ' ').trim().slice(0, 80);
++    if (m) return safeSlice(m[0].replace(/\s+/g, ' ').trim(), 80);
+   }
+   return null;
+ }
+@@ -489,7 +498,7 @@ export const postToolUseVisibility: HookCallback = async (input, toolUseId) => {
+ 
+   // FAILURE PATH 1 — explicit PostToolUseFailure event with `error` field.
+   if (i.hook_event_name === 'PostToolUseFailure') {
+-    const reason = (i.error ?? 'failed').replace(/\s+/g, ' ').trim().slice(0, 80);
++    const reason = safeSlice((i.error ?? 'failed').replace(/\s+/g, ' ').trim(), 80);
+     const merged = desc ? `${desc}  ✗ ${reason}` : `✗ ${reason}`;
+     emit(formatToolLine('❌', label, merged));
+     return { continue: true };
+diff --git a/src/channels/chat-sdk-bridge.test.ts b/src/channels/chat-sdk-bridge.test.ts
+index 89dfeaa..3569168 100644
+--- a/src/channels/chat-sdk-bridge.test.ts
++++ b/src/channels/chat-sdk-bridge.test.ts
+@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
+ 
+ import { createChatSdkBridge, splitForLimit } from './chat-sdk-bridge.js';
++import * as bridgeModule from './chat-sdk-bridge.js';
+ 
+ vi.mock('../webhook-server.js', () => ({
+   registerWebhookAdapter: vi.fn(),
+@@ -524,3 +525,32 @@ describe('createChatSdkBridge.deliver — tool-vis collapse to <details> fold (P
+     }
+   });
+ });
++
++describe('toWellFormedText + surrogate-safe chunking (PATCH 23)', () => {
++  it('REGRESSION: a preview line ending in half an emoji is sanitized, not sent raw', () => {
++    // Real production shape (2026-07-07): tool-vis line ended "…open-loops • \ud83d"
++    // → Telegram rejected the bubble AND, via the pre-send flush, every later
++    // real message on that chat: "text must be encoded in UTF-8".
++    const { toWellFormedText } = bridgeModule;
++    const poisoned = '⚠️ 0 stale • 🔄 3 open-loops • \ud83d';
++    const clean = toWellFormedText(poisoned);
++    expect(clean).toBe('⚠️ 0 stale • 🔄 3 open-loops • �');
++    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(clean)).toBe(false);
++  });
++
++  it('leaves well-formed text byte-identical', () => {
++    const { toWellFormedText } = bridgeModule;
++    const s = 'normal 🤖 text with emoji 📊 and umlauts äöü';
++    expect(toWellFormedText(s)).toBe(s);
++  });
++
++  it('splitForLimit hard cut never splits a surrogate pair', () => {
++    // 29 chars then an emoji straddling the limit=30 boundary.
++    const text = 'x'.repeat(29) + '📊'.repeat(10);
++    const chunks = splitForLimit(text, 30);
++    for (const c of chunks) {
++      expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(c)).toBe(false);
++    }
++    expect(chunks.join('')).toBe(text); // nothing lost
++  });
++});
+diff --git a/src/channels/chat-sdk-bridge.ts b/src/channels/chat-sdk-bridge.ts
+index 0679ac6..9a1c72e 100644
+--- a/src/channels/chat-sdk-bridge.ts
++++ b/src/channels/chat-sdk-bridge.ts
+@@ -164,6 +164,21 @@ function enqueueOutbound<T>(tid: string, fn: () => Promise<T>): Promise<T> {
+   return next;
+ }
+ 
++/**
++ * PATCH 23: replace lone UTF-16 surrogates (an emoji cut in half by some
++ * upstream truncation) with U+FFFD. A lone surrogate is invalid UTF-8 on the
++ * wire — Telegram rejects the send ("text must be encoded in UTF-8"),
++ * including the plain-text fallback, so the message is dropped entirely.
++ * (Node 22 has String.prototype.toWellFormed; typed via a cast because the
++ * tsconfig lib predates ES2024. Regex fallback covers exotic runtimes.)
++ */
++export function toWellFormedText(t: string): string {
++  const fn = (t as unknown as { toWellFormed?: () => string }).toWellFormed;
++  return typeof fn === 'function'
++    ? fn.call(t)
++    : t.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
++}
++
+ export function splitForLimit(text: string, limit: number): string[] {
+   if (text.length <= limit) return [text];
+   const chunks: string[] = [];
+@@ -173,6 +188,10 @@ export function splitForLimit(text: string, limit: number): string[] {
+     if (cut <= 0) cut = remaining.lastIndexOf('\n', limit);
+     if (cut <= 0) cut = remaining.lastIndexOf(' ', limit);
+     if (cut <= 0) cut = limit;
++    // PATCH 23: a hard cut must not land between the halves of a surrogate
++    // pair — back off one unit so the emoji moves whole into the next chunk.
++    const before = remaining.charCodeAt(cut - 1);
++    if (before >= 0xd800 && before <= 0xdbff) cut -= 1;
+     chunks.push(remaining.slice(0, cut).trimEnd());
+     remaining = remaining.slice(cut).trimStart();
+   }
+@@ -366,7 +385,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
+         `non-empty, only letters, digits, '.', '_' or '-'`,
+     );
+   }
+-  const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
++  // PATCH 23: sanitize lone UTF-16 surrogates (e.g. an emoji cut in half by a
++  // preview truncation) at the single outbound choke point. One poisoned
++  // string otherwise makes the platform API reject with "text must be encoded
++  // in UTF-8" — including the plain-text fallback, so the message (and, via
++  // the pre-send tool-vis flush, EVERY later message on that chat) is dropped
++  // until a host restart.
++  const transformText = (t: string): string =>
++    toWellFormedText(config.transformOutboundText ? config.transformOutboundText(t) : t);
+   let chat: Chat;
+   let state: SqliteStateAdapter;
+   let setupConfig: ChannelSetup;
+@@ -648,7 +674,19 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
+         // pending coalesced state, PATCH 09) so the agent's actual answer
+         // renders as a separate, fresh, notifying bubble below the completed
+         // tool-vis timeline.
+-        await finalizeToolVis(tid, accumKey);
++        // PATCH 23: never let a broken tool-vis bubble block the real reply —
++        // finalize failures are logged and the bubble dropped, not propagated
++        // (a propagated throw was attributed to the real message by delivery
++        // retry, permanently dropping every reply on this chat).
++        try {
++          await finalizeToolVis(tid, accumKey);
++        } catch (err) {
++          log.warn('Tool-vis finalize failed — dropping bubble, continuing with real message', {
++            tid,
++            err: String((err as { message?: string })?.message ?? err),
++          });
++          toolVisAccumulators.delete(accumKey);
++        }
+ 
+         if (content.operation === 'edit' && content.messageId) {
+           await adapter.editMessage(tid, content.messageId as string, {

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
 import { createChatSdkBridge, splitForLimit } from './chat-sdk-bridge.js';
+import * as bridgeModule from './chat-sdk-bridge.js';
 
 vi.mock('../webhook-server.js', () => ({
   registerWebhookAdapter: vi.fn(),
@@ -522,5 +523,34 @@ describe('createChatSdkBridge.deliver — tool-vis collapse to <details> fold (P
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('toWellFormedText + surrogate-safe chunking (PATCH 23)', () => {
+  it('REGRESSION: a preview line ending in half an emoji is sanitized, not sent raw', () => {
+    // Real production shape (2026-07-07): tool-vis line ended "…open-loops • \ud83d"
+    // → Telegram rejected the bubble AND, via the pre-send flush, every later
+    // real message on that chat: "text must be encoded in UTF-8".
+    const { toWellFormedText } = bridgeModule;
+    const poisoned = '⚠️ 0 stale • 🔄 3 open-loops • \ud83d';
+    const clean = toWellFormedText(poisoned);
+    expect(clean).toBe('⚠️ 0 stale • 🔄 3 open-loops • �');
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(clean)).toBe(false);
+  });
+
+  it('leaves well-formed text byte-identical', () => {
+    const { toWellFormedText } = bridgeModule;
+    const s = 'normal 🤖 text with emoji 📊 and umlauts äöü';
+    expect(toWellFormedText(s)).toBe(s);
+  });
+
+  it('splitForLimit hard cut never splits a surrogate pair', () => {
+    // 29 chars then an emoji straddling the limit=30 boundary.
+    const text = 'x'.repeat(29) + '📊'.repeat(10);
+    const chunks = splitForLimit(text, 30);
+    for (const c of chunks) {
+      expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(c)).toBe(false);
+    }
+    expect(chunks.join('')).toBe(text); // nothing lost
   });
 });
