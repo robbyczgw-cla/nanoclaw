@@ -4,4 +4,5 @@
 
 import './claude.js';
 import './codex.js';
+import './xai.js';
 import './mock.js';
